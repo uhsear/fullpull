@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.gdb/
+*.lock
+downloads/
+resp*.json
+download rest service.txt
