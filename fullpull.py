@@ -7,6 +7,11 @@ argument list serves both.
 The contract that matters: a layer either lands complete or it raises. Every layer is
 verified against the server's own record count before it is accepted.
 
+Four paging strategies back that contract, cheapest first: resultOffset paging, objectId
+batching, objectId range windows, and a recursive envelope quadtree. A strategy that
+raises, or that finishes with the wrong record count, hands the layer to the next one.
+Only an exhausted list fails the layer. --resume skips layers an interrupted run finished.
+
 Why not just hand the REST URL to arcpy.conversion.ExportFeatures, which also works and
 also pages correctly? Measured on Public/PublicWorks/0 (3,317 records): ExportFeatures
 took 254s, this script took 1.4s. Roughly 180x, so the manual paging earns its keep.
@@ -16,6 +21,7 @@ line. Command-line arguments win over CONFIG when both are set.
 
     python fullpull.py                          # uses CONFIG below
     python fullpull.py <service_url> <output_folder>
+    python fullpull.py <service_url> <output_folder> --resume
     python fullpull.py --self-check
 """
 
@@ -80,6 +86,15 @@ MAX_PAGE = 5_000
 # with exponential backoff on 429/500/502/503/504.
 TIMEOUT = 180
 RETRIES = 4
+
+# How many times the envelope strategy may subdivide before it stops splitting a cell
+# and fetches that cell by its ID list instead. Only cells that come back full are split,
+# so depth costs nothing on the empty parts of an extent. The cap matters for the case
+# subdivision cannot fix -- more coincident features at one coordinate than the page size,
+# where every split hands the whole pile to one child forever. Lower it to reach the
+# ID-list fallback sooner on dense data; raise it if a cell's ID list is itself too big.
+# Only the last-resort strategy uses this; the three before it never subdivide.
+MAX_ENVELOPE_DEPTH = 12
 
 # Layer the --self-check exercises. Defaults to Esri's public sample server, which exists
 # for this purpose. Point it at your own server rather than sending test traffic to
@@ -274,8 +289,13 @@ def iter_pages_by_oid(session, layer_url, size, token=None, geom=None, where="1=
         session, f"{layer_url}/query",
         {"where": where, "returnIdsOnly": "true"}, token=token,
     ).get("objectIds") or []
-    ids.sort()
     params = {"outFields": "*", "returnGeometry": "true", **(geom or {})}
+    yield from _pages_by_ids(session, layer_url, ids, size, params, token=token)
+
+
+def _pages_by_ids(session, layer_url, ids, size, params, token=None):
+    """Fetch an explicit ID list in batches of `size`. Shared by two strategies."""
+    ids = sorted(ids or [])
     for i in range(0, len(ids), size):
         batch = ids[i:i + size]
         page = rest_get(
@@ -284,6 +304,189 @@ def iter_pages_by_oid(session, layer_url, size, token=None, geom=None, where="1=
         )
         if page.get("features"):
             yield page
+
+
+def iter_pages_by_oid_range(session, layer_url, size, oid, token=None, geom=None, where="1=1"):
+    """Fallback for a service that will not hand over the whole ID list at once.
+
+    returnIdsOnly=true is one request whose *response* grows with the layer, so the
+    layer that answers a 25,000-row query with HTTP 500 can refuse the ID list too.
+    This asks only for the smallest and largest OID, then walks that range in windows
+    of `size` expressed as a where clause. Nothing about the request or the response
+    grows with the layer.
+
+    OIDs are unique, so a window `size` wide can never contain more than `size` rows.
+    That is what makes this safe where the previous two strategies are not: no window
+    can exceed the page size, so no window can be silently truncated. Sparse OIDs cost
+    extra empty requests, never lost records.
+    """
+    if not oid:
+        raise RuntimeError("objectId range paging needs an OID field; the layer publishes none")
+    stats = [
+        {"statisticType": "min", "onStatisticField": oid, "outStatisticFieldName": "oid_min"},
+        {"statisticType": "max", "onStatisticField": oid, "outStatisticFieldName": "oid_max"},
+    ]
+    row = rest_get(
+        session, f"{layer_url}/query",
+        {"where": where, "outStatistics": json.dumps(stats)}, token=token,
+    )
+    attrs = ((row.get("features") or [{}])[0].get("attributes")) or {}
+    lo, hi = attrs.get("oid_min"), attrs.get("oid_max")
+    if lo is None or hi is None:
+        raise RuntimeError("server returned no OID statistics")
+
+    params = {"outFields": "*", "returnGeometry": "true", "orderByFields": oid, **(geom or {})}
+    start, end_of_layer = int(lo), int(hi)
+    while start <= end_of_layer:
+        stop = start + size - 1
+        window = f"{oid} >= {start} AND {oid} <= {stop}"
+        clause = window if where in (None, "", "1=1") else f"({where}) AND {window}"
+        page = rest_get(
+            session, f"{layer_url}/query", {**params, "where": clause}, token=token,
+        )
+        if page.get("features"):
+            yield page
+        start = stop + 1
+
+
+def _split_envelope(env):
+    """Split an extent into four quadrants, carrying its spatialReference along."""
+    xmid = (env["xmin"] + env["xmax"]) / 2.0
+    ymid = (env["ymin"] + env["ymax"]) / 2.0
+    corners = (
+        (env["xmin"], env["ymin"], xmid, ymid),
+        (xmid, env["ymin"], env["xmax"], ymid),
+        (env["xmin"], ymid, xmid, env["ymax"]),
+        (xmid, ymid, env["xmax"], env["ymax"]),
+    )
+    quads = []
+    for xmin, ymin, xmax, ymax in corners:
+        quad = {"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax}
+        if env.get("spatialReference"):
+            quad["spatialReference"] = env["spatialReference"]
+        quads.append(quad)
+    return quads
+
+
+def _query_extent(session, layer_url, where, token=None):
+    """The extent of the rows that match `where`, or None if the server will not say.
+
+    The published layer extent is a promise nobody checks. SF311 on Esri's own sample
+    server publishes -180..180, a whole world, for data that fits inside San Francisco.
+    Subdividing a world extent to reach a city wastes eight levels before the first row
+    appears. Asking the server for the extent of the actual result set starts the tree
+    where the data is. One extra request, and the strategy degrades to the published
+    extent if the server does not support it.
+    """
+    try:
+        env = rest_get(
+            session, f"{layer_url}/query",
+            {"where": where, "returnExtentOnly": "true"}, token=token,
+        ).get("extent")
+    except Exception:
+        return None
+    if not env or env.get("xmin") is None or env.get("xmax") is None:
+        return None
+    # A degenerate extent (one point, or NaN from an empty result) cannot be split.
+    if not (env["xmax"] > env["xmin"] and env["ymax"] > env["ymin"]):
+        return None
+    return env
+
+
+def iter_pages_by_envelope(session, layer_url, size, oid, meta,
+                           token=None, geom=None, where="1=1", max_depth=None):
+    """Last resort: recursively subdivide the layer's extent until every query is small.
+
+    The three strategies above all ask the server to hand back a known slice of the
+    layer. This one never asks for a slice that could be too big in the first place: it
+    queries an envelope, and any envelope that comes back full is assumed truncated and
+    split into quadrants. Requests only ever get smaller, which is why this survives a
+    layer that returns HTTP 500 above some row count. It is also the slowest strategy by
+    a wide margin, which is why it is tried last.
+
+    A feature straddling a quadrant boundary is returned by both queries, so rows are
+    de-duplicated on the OID before they are yielded. That is the whole reason this
+    strategy needs an OID field.
+    """
+    if not oid:
+        raise RuntimeError("envelope paging needs an OID field to de-duplicate on; none found")
+    if not meta.get("geometryType"):
+        raise RuntimeError("envelope paging needs geometry; this is a table")
+    extent = _query_extent(session, layer_url, where, token) or meta.get("extent") or {}
+    if extent.get("xmin") is None or extent.get("xmax") is None:
+        raise RuntimeError("layer publishes no extent; envelope paging has nowhere to start")
+
+    cap = MAX_ENVELOPE_DEPTH if max_depth is None else max_depth
+    params = {
+        "where": where, "outFields": "*", "returnGeometry": "true",
+        "geometryType": "esriGeometryEnvelope",
+        "spatialRel": "esriSpatialRelIntersects",
+        **(geom or {}),
+    }
+    sr = extent.get("spatialReference") or {}
+    in_sr = sr.get("latestWkid") or sr.get("wkid")
+    if in_sr:
+        params["inSR"] = str(in_sr)
+
+    # A row with no geometry is invisible to every spatial query, so no amount of
+    # subdivision will ever reach it. Measured on Esri's own SF311 sample layer: 9,705
+    # rows, of which 9,703 answer a full-extent envelope query. Find that out here, in
+    # two requests, and refuse -- rather than sweeping the whole layer and handing back
+    # a short result that looks like a successful download.
+    counted = {"where": where, "returnCountOnly": "true"}
+    total = rest_get(session, f"{layer_url}/query", counted, token=token).get("count")
+    reachable = rest_get(
+        session, f"{layer_url}/query",
+        {**counted, "geometry": json.dumps(extent),
+         "geometryType": "esriGeometryEnvelope",
+         "spatialRel": "esriSpatialRelIntersects",
+         **({"inSR": str(in_sr)} if in_sr else {})},
+        token=token,
+    ).get("count")
+    if total is not None and reachable is not None and reachable < total:
+        raise RuntimeError(
+            f"{total - reachable} of {total} rows have no geometry; "
+            "envelope paging cannot reach them"
+        )
+
+    seen = set()
+    stack = [(extent, 0)]
+    while stack:
+        env, depth = stack.pop()
+        page = rest_get(
+            session, f"{layer_url}/query",
+            {**params, "geometry": json.dumps(env), "resultRecordCount": size},
+            token=token,
+        )
+        feats = page.get("features") or []
+        # A full page is indistinguishable from a truncated one, so treat it as
+        # truncated. Splitting a quadrant that was in fact complete costs four
+        # requests; trusting a full page that was truncated loses records.
+        if len(feats) >= size or page.get("exceededTransferLimit"):
+            if depth >= cap:
+                # Subdivision has stopped helping: either the rows are coincident, or
+                # the cell is small enough that the ID list for it is safe to ask for
+                # even though the whole layer's was not. Fetch this cell by ID and
+                # move on, so one dense block cannot fail the layer.
+                cell = {k: v for k, v in params.items() if k != "resultRecordCount"}
+                ids = rest_get(
+                    session, f"{layer_url}/query",
+                    {**cell, "geometry": json.dumps(env), "returnIdsOnly": "true"},
+                    token=token,
+                ).get("objectIds") or []
+                for page in _pages_by_ids(session, layer_url, ids, size, params, token=token):
+                    fresh = [f for f in page["features"]
+                             if f.get("attributes", {}).get(oid) not in seen]
+                    seen.update(f["attributes"][oid] for f in fresh)
+                    if fresh:
+                        yield {**page, "features": fresh}
+                continue
+            stack.extend((quad, depth + 1) for quad in _split_envelope(env))
+            continue
+        fresh = [f for f in feats if f.get("attributes", {}).get(oid) not in seen]
+        seen.update(f["attributes"][oid] for f in fresh)
+        if fresh:
+            yield {**page, "features": fresh}
 
 
 # ---------------------------------------------------------------------- ingestion
@@ -371,38 +574,79 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
         arcpy.management.Delete(staging)
 
     geom = geometry_params(meta, out_sr)
+
+    # Four strategies, cheapest first, each one surviving a failure mode the one before
+    # it does not. A strategy that raises, or that finishes with the wrong record count,
+    # hands over to the next instead of failing the layer. Only an exhausted list is a
+    # failure. The old behaviour -- one strategy, raise on shortfall -- turned a layer
+    # the server merely paged badly into a failed run.
+    strategies = []
     if paged:
-        pages = iter_pages(session, layer_url, size, oid, expected,
-                           token=token, geom=geom, where=where)
-    else:
-        pages = iter_pages_by_oid(session, layer_url, size,
-                                  token=token, geom=geom, where=where)
+        strategies.append((
+            "resultOffset paging",
+            lambda: iter_pages(session, layer_url, size, oid, expected,
+                               token=token, geom=geom, where=where),
+        ))
+    strategies.append((
+        "objectId list",
+        lambda: iter_pages_by_oid(session, layer_url, size,
+                                  token=token, geom=geom, where=where),
+    ))
+    strategies.append((
+        "objectId range",
+        lambda: iter_pages_by_oid_range(session, layer_url, size, oid,
+                                        token=token, geom=geom, where=where),
+    ))
+    if meta.get("geometryType"):
+        strategies.append((
+            "envelope quadtree",
+            lambda: iter_pages_by_envelope(session, layer_url, size, oid, meta,
+                                           token=token, geom=geom, where=where),
+        ))
 
-    tmpdir = tempfile.mkdtemp(prefix="restdl_")
-    try:
-        for seq, page in enumerate(pages):
-            _write_page(page, staging, tmpdir, seq)
-
-        if not arcpy.Exists(staging):
-            raise RuntimeError(
-                f"{layer['name']}: server reported {expected} records but returned none."
+    got, failures = None, []
+    for index, (label, open_pages) in enumerate(strategies):
+        tmpdir = tempfile.mkdtemp(prefix="restdl_")
+        try:
+            # Each attempt starts from an empty staging class. A half-written attempt
+            # left in place would be appended to by the next strategy and verify as
+            # a duplicate-laden success.
+            if arcpy.Exists(staging):
+                arcpy.management.Delete(staging)
+            for seq, page in enumerate(open_pages()):
+                _write_page(page, staging, tmpdir, seq)
+            if not arcpy.Exists(staging):
+                raise RuntimeError(f"server reported {expected} records but returned none")
+            count = int(arcpy.management.GetCount(staging)[0])
+            if expected is not None and count != expected:
+                raise RuntimeError(f"downloaded {count} of {expected} records")
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+            if arcpy.Exists(staging):
+                arcpy.management.Delete(staging)
+            continue
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        got = count
+        if index:
+            # Never let a fallback pass silently. A layer that needs the quadtree is a
+            # layer whose server is misreporting something, and that is worth knowing.
+            arcpy.AddWarning(
+                f"{layer['name']}: {label} succeeded after "
+                f"{len(failures)} failed strateg{'y' if len(failures) == 1 else 'ies'}: "
+                + " | ".join(failures)
             )
-        got = int(arcpy.management.GetCount(staging)[0])
-        if expected is not None and got != expected:
-            raise RuntimeError(
-                f"{layer['name']}: downloaded {got} of {expected} records; "
-                "existing output left untouched."
-            )
+        break
 
-        if arcpy.Exists(target):
-            arcpy.management.Delete(target)
-        arcpy.management.Rename(staging, target)
-    except Exception:
-        if arcpy.Exists(staging):
-            arcpy.management.Delete(staging)
-        raise
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    if got is None:
+        raise RuntimeError(
+            f"{layer['name']}: every strategy failed, existing output left untouched. "
+            + " | ".join(failures)
+        )
+
+    if arcpy.Exists(target):
+        arcpy.management.Delete(target)
+    arcpy.management.Rename(staging, target)
 
     return name, got
 
@@ -423,8 +667,35 @@ def gdb_name_for(service_url):
     return f"{safe or 'OutputData'}.gdb"
 
 
+def _progress_path(gdb):
+    return gdb + ".progress.json"
+
+
+def _load_progress(path):
+    """Completed layers from an earlier interrupted run, or {} if there is no usable file.
+
+    A missing, truncated or hand-edited progress file must never abort a pull. The worst
+    case of ignoring it is that every layer is downloaded again, which is what would have
+    happened without the file at all.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_progress(path, done):
+    """Write the progress file atomically, so a kill mid-write cannot corrupt it."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(done, fh, indent=1)
+    os.replace(tmp, path)
+
+
 def download_service(service_url, output_folder, gdb_name=None,
-                     token=None, out_sr=None, where=None):
+                     token=None, out_sr=None, where=None, resume=False):
     """Download every queryable layer of a service. Returns list of (name, count)."""
     service_url = service_url.rstrip("/")
     where = where or WHERE
@@ -448,12 +719,29 @@ def download_service(service_url, output_folder, gdb_name=None,
     # a name, and ValidateTableName can fold two distinct names onto one; without this the
     # second layer silently replaces the first and both report success.
     taken = set()
+    # Resume trusts the earlier run's word that a layer finished; it does not re-verify
+    # the count against the server. A layer that changed since that run stays as it was
+    # until the next full pull, which is the trade a resume makes.
+    progress_path = _progress_path(gdb)
+    done = _load_progress(progress_path) if resume else {}
+
     results, failures = [], []
     for layer in layers:
+        key = str(layer["id"])
+        prior = done.get(key)
+        if prior and arcpy.Exists(os.path.join(gdb, prior["name"])):
+            taken.add(prior["name"].lower())
+            results.append((prior["name"], prior["count"]))
+            arcpy.AddMessage(
+                f"{layer['name']}: already complete ({prior['count']} records), skipped"
+            )
+            continue
         try:
             name, count = download_layer(session, service_url, layer, gdb, service_max,
                                          taken, token=token, out_sr=out_sr, where=where)
             results.append((name, count))
+            done[key] = {"name": name, "count": count}
+            _save_progress(progress_path, done)
             arcpy.AddMessage(f"{layer['name']}: {count} records -> {os.path.join(gdb, name)}")
         except Exception as exc:
             failures.append((layer["name"], str(exc)))
@@ -462,11 +750,60 @@ def download_service(service_url, output_folder, gdb_name=None,
     arcpy.AddMessage(f"Done. {len(results)} layer(s) complete, {len(failures)} failed.")
     if failures:
         # A partial run must not exit clean, or a scheduled job reports success on bad data.
+        # The progress file survives deliberately: --resume picks up from here.
         raise RuntimeError("Failed layers: " + "; ".join(n for n, _ in failures))
+    # Clean run, so the progress file has nothing left to say. Leaving it would make the
+    # next --resume run skip the whole service and report success without fetching a row.
+    try:
+        os.remove(progress_path)
+    except OSError:
+        pass
     return results
 
 
 # ------------------------------------------------------------------- self-check
+
+
+def _offline_checks():
+    """Assertions that need no server, run first so a network fault cannot mask a bug.
+
+    The two pieces of logic here are the ones a live check cannot exercise on demand:
+    a server that truncates on cue is not something a public sample service provides,
+    and an interrupted run is not something a check can stage against production.
+    """
+    parent = {"xmin": 0.0, "ymin": 0.0, "xmax": 10.0, "ymax": 20.0,
+              "spatialReference": {"wkid": 2237}}
+    quads = _split_envelope(parent)
+    assert len(quads) == 4, "an envelope splits into exactly four quadrants"
+    assert all(q["spatialReference"] == parent["spatialReference"] for q in quads), \
+        "quadrants must carry the parent spatial reference or the query reprojects"
+    area = sum((q["xmax"] - q["xmin"]) * (q["ymax"] - q["ymin"]) for q in quads)
+    assert abs(area - 200.0) < 1e-9, "quadrants must tile the parent exactly, no gaps or overlap"
+    assert {(q["xmin"], q["ymin"]) for q in quads} == {(0.0, 0.0), (5.0, 0.0),
+                                                       (0.0, 10.0), (5.0, 10.0)}, \
+        "quadrants must be the four corners, not four copies"
+    assert _split_envelope({"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1})[0].get(
+        "spatialReference") is None, "an extent with no SR must not gain an empty one"
+
+    tmp = tempfile.mkdtemp(prefix="restdl_progress_")
+    try:
+        path = os.path.join(tmp, "x.gdb.progress.json")
+        assert _load_progress(path) == {}, "a missing progress file reads as nothing done"
+        _save_progress(path, {"0": {"name": "Roads", "count": 12}})
+        assert _load_progress(path)["0"]["count"] == 12, "progress must survive a round trip"
+        _save_progress(path, {"0": {"name": "Roads", "count": 12},
+                              "3": {"name": "Signs", "count": 4}})
+        assert len(_load_progress(path)) == 2, "a later save must not lose an earlier layer"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"0": {"name": "Ro')
+        assert _load_progress(path) == {}, "a truncated progress file must not raise"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("[1, 2, 3]")
+        assert _load_progress(path) == {}, "a progress file of the wrong shape must not raise"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("offline checks OK: 10 assertions")
 
 
 def self_check():
@@ -476,6 +813,8 @@ def self_check():
     rows, so the check proves both that this pager gets them all and that the naive
     stride does not. Configure the target with SELF_CHECK_URL / SELF_CHECK_LAYER.
     """
+    _offline_checks()
+
     url = SELF_CHECK_URL
     session = make_session()
     layer_url = f"{url}/{SELF_CHECK_LAYER}"
@@ -543,6 +882,8 @@ def main(argv=None):
     ap.add_argument("out_sr", nargs="?", default="", help="Output WKID, e.g. 2237")
     ap.add_argument("where", nargs="?", default="", help="Server-side filter")
     ap.add_argument("--self-check", action="store_true", help="Run the live self-check and exit")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip layers an earlier interrupted run already finished")
     args = ap.parse_args(argv)
 
     if args.self_check:
@@ -563,6 +904,7 @@ def main(argv=None):
         token=args.token or TOKEN or None,
         out_sr=args.out_sr or OUT_SR or None,
         where=args.where or WHERE,
+        resume=args.resume,
     )
     return 0
 

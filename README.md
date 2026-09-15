@@ -52,11 +52,48 @@ the map is missing features.
   return HTTP 400 on a count query.
 - Name collisions suffixed rather than overwritten. Two layers in one service can share a name, and
   geodatabase name validation can fold two names into one.
-- Falls back to `objectIds` batching when a service reports `supportsPagination: false`, and also
-  when it does not report the capability at all. Servers before 10.3 omit it and ignore
-  `resultOffset`, re-serving page one; if the row count divides evenly by the page size, a count
-  check alone would accept the duplicates.
+- Four paging strategies, cheapest first. A strategy that raises, or that finishes with the wrong
+  record count, hands the layer to the next one. Only an exhausted list fails the layer.
+- Resume: `--resume` skips layers an interrupted run already finished.
 - Retries with backoff on 429 and 5xx, request timeouts, connection reuse, token support.
+
+## The four strategies
+
+| # | Strategy | Used when | Survives |
+|---|---|---|---|
+| 1 | `resultOffset` paging | the layer reports `supportsPagination` | nothing extra; it is simply the fastest |
+| 2 | `objectIds` batching | pagination is absent, or strategy 1 came up short | a server that ignores `resultOffset` and re-serves page one |
+| 3 | `objectId` range windows | the ID list request itself fails | a layer too large to hand back its own ID list |
+| 4 | envelope quadtree | everything else failed | a layer that returns HTTP 500 above some row count |
+
+Strategy 2 is the pre-10.3 fallback that was already here. Servers before 10.3 omit
+`supportsPagination` and ignore `resultOffset`, re-serving page one; if the row count divides evenly
+by the page size, a count check alone would accept the duplicates.
+
+Strategy 3 asks only for the smallest and largest OID, then walks that range in where-clause windows
+`MAX_PAGE` wide. OIDs are unique, so a window that wide can never hold more rows than one page.
+No window can be truncated. Sparse OIDs cost empty requests, never lost rows.
+
+Strategy 4 never asks for a slice that could be too big. It queries an envelope, treats any full
+response as truncated, and splits it into quadrants. Requests only ever get smaller, which is why
+this is the one that survives a server that 500s on large responses. It is also by far the slowest.
+Three things it does that a naive quadtree does not:
+
+- It starts from `returnExtentOnly` on the actual query, not the published layer extent. Esri's own
+  SF311 sample layer publishes a whole-world extent for data that fits inside San Francisco;
+  starting there wastes eight levels of subdivision before the first row appears.
+- Boundary features are returned by every quadrant that touches them, so rows are de-duplicated on
+  the OID. This is why strategy 4 needs an OID field.
+- At `MAX_ENVELOPE_DEPTH` it stops splitting and fetches the cell by its ID list, so a block of
+  coincident features cannot subdivide forever.
+
+Strategy 4 refuses up front if any row has no geometry, because no spatial query can ever reach one.
+It costs two count requests to find out. Measured on SF311: 9,705 rows, of which 9,703 answer a
+full-extent envelope query. Refusing is the point — the alternative is sweeping the whole layer and
+returning 9,703 rows that look like a complete download.
+
+A layer that falls back logs an `AddWarning` naming the strategy that worked and every failure
+before it. A silent fallback would hide a server that is misreporting its own capabilities.
 
 ## Requirements
 
@@ -84,6 +121,8 @@ WHERE         = "1=1"     # server side row filter
 MAX_PAGE      = 5_000     # ceiling on one page, whatever the service advertises
 TIMEOUT       = 180       # seconds per request
 RETRIES       = 4         # retries with backoff on 429 and 5xx
+
+MAX_ENVELOPE_DEPTH = 12   # subdivisions before strategy 4 fetches a cell by ID list
 ```
 
 ```
@@ -96,8 +135,27 @@ Arguments override CONFIG:
 propy fullpull.py <service_url> <output_folder> [gdb_name] [token] [out_sr] [where]
 ```
 
+Flags:
+
+| Flag | Does |
+|---|---|
+| `--self-check` | Run the checks below and exit |
+| `--resume` | Skip layers an earlier interrupted run already finished |
+
 To use it as an ArcGIS script tool, add it with those six parameters in that order. A script tool
 passes parameters as positional arguments, so there is no separate code path.
+
+## Resume
+
+Every completed layer is recorded in `<geodatabase>.progress.json` next to the geodatabase, written
+atomically after each layer. A run that fails part way through leaves that file behind; `--resume`
+reads it and skips the layers it names, provided the feature class is still there. A clean run
+deletes it, so a scheduled `--resume` job cannot skip an entire service and report success without
+fetching a row.
+
+Resume trusts the earlier run's word that a layer finished. It does not re-verify that layer's count
+against the server, so a layer that changed between the two runs stays as the first run left it
+until the next full pull. That is the trade a resume makes.
 
 ## Self check
 
@@ -105,9 +163,14 @@ passes parameters as positional arguments, so there is no separate code path.
 propy fullpull.py --self-check
 ```
 
-Runs against a live layer holding more records than its own `maxRecordCount`, the shape that breaks
-a naive pager. It asserts that paging returns every row, that an oversized page request still
-returns every row, that the naive 5000 stride demonstrably loses rows, and that a full
+Ten offline assertions run first, so a network fault cannot mask a logic bug: envelope splitting
+(four quadrants, tiling the parent exactly, spatial reference carried, no invented empty one) and
+the progress file (round trip, a later save not losing an earlier layer, a truncated file and a
+wrong-shaped file both reading as nothing done rather than raising).
+
+The live half then runs against a layer holding more records than its own `maxRecordCount`, the
+shape that breaks a naive pager. It asserts that paging returns every row, that an oversized page
+request still returns every row, that the naive 5000 stride demonstrably loses rows, and that a full
 `download_layer` writes the verified count.
 
 It defaults to Esri's public sample server. Point it at your own with `SELF_CHECK_URL` and
