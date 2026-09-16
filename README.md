@@ -219,3 +219,4 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [restfake](https://github.com/uhsear/restfake) - a fake REST endpoint to test this against, including the page that comes back short
 - [fcload](https://github.com/uhsear/fcload) - loading the downloaded geodatabase somewhere else, without corrupting it
+- [svcdrift](https://github.com/uhsear/svcdrift) - check the schema still matches its source before you pull
