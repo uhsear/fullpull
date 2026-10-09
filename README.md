@@ -163,7 +163,7 @@ until the next full pull. That is the trade a resume makes.
 propy fullpull.py --self-check
 ```
 
-Ten offline assertions run first, so a network fault cannot mask a logic bug: envelope splitting
+Eleven offline assertions run first, so a network fault cannot mask a logic bug: envelope splitting
 (four quadrants, tiling the parent exactly, spatial reference carried, no invented empty one) and
 the progress file (round trip, a later save not losing an earlier layer, a truncated file and a
 wrong-shaped file both reading as nothing done rather than raising).

@@ -26,6 +26,8 @@ line. Command-line arguments win over CONFIG when both are set.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -803,7 +805,17 @@ def _offline_checks():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    print("offline checks OK: 10 assertions")
+    # Prefix of --self-check (the longest flag). Parser must refuse it, not expand it.
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            _parser().parse_args(["--self"])
+        refused = False
+    except SystemExit:
+        refused = True
+    assert refused, "a unique prefix of a flag must be refused, not expanded"  # <-- pinned defect
+
+    print("offline checks OK: 11 assertions")
 
 
 def self_check():
@@ -870,11 +882,9 @@ def _scratch_gdb(folder):
 # ------------------------------------------------------------------------- main
 
 
-def main(argv=None):
-    # One code path for both entry points: an ArcGIS script tool hands its parameters
-    # to the script as sys.argv, so positional arguments serve the tool and the shell
-    # alike. Unset tool parameters arrive as empty strings, hence the `or default`.
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def _parser():
+    # allow_abbrev=False: a unique prefix of a flag must not silently select that flag.
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     ap.add_argument("service_url", nargs="?", help="MapServer or FeatureServer URL")
     ap.add_argument("output_folder", nargs="?", help="Folder to hold the file geodatabase")
     ap.add_argument("gdb_name", nargs="?", default="", help="Geodatabase name")
@@ -884,6 +894,14 @@ def main(argv=None):
     ap.add_argument("--self-check", action="store_true", help="Run the live self-check and exit")
     ap.add_argument("--resume", action="store_true",
                     help="Skip layers an earlier interrupted run already finished")
+    return ap
+
+
+def main(argv=None):
+    # One code path for both entry points: an ArcGIS script tool hands its parameters
+    # to the script as sys.argv, so positional arguments serve the tool and the shell
+    # alike. Unset tool parameters arrive as empty strings, hence the `or default`.
+    ap = _parser()
     args = ap.parse_args(argv)
 
     if args.self_check:
