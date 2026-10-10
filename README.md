@@ -56,6 +56,8 @@ the map is missing features.
   record count, hands the layer to the next one. Only an exhausted list fails the layer.
 - Resume: `--resume` skips layers an interrupted run already finished.
 - Retries with backoff on 429 and 5xx, request timeouts, connection reuse, token support.
+- An optional delay between requests (`--delay` or `DELAY`), for public servers behind a web
+  application firewall that bans clients for their request rate. Off by default.
 
 ## The four strategies
 
@@ -121,6 +123,7 @@ WHERE         = "1=1"     # server side row filter
 MAX_PAGE      = 5_000     # ceiling on one page, whatever the service advertises
 TIMEOUT       = 180       # seconds per request
 RETRIES       = 4         # retries with backoff on 429 and 5xx
+DELAY         = 0.0       # seconds between requests; 0.5 to 1 on a rate-limited public server
 
 MAX_ENVELOPE_DEPTH = 12   # subdivisions before strategy 4 fetches a cell by ID list
 ```
@@ -141,6 +144,7 @@ Flags:
 |---|---|
 | `--self-check` | Run the checks below and exit |
 | `--resume` | Skip layers an earlier interrupted run already finished |
+| `--delay SECONDS` | Wait this long between the start of one request and the next. Overrides `DELAY`. A negative value is refused |
 
 To use it as an ArcGIS script tool, add it with those six parameters in that order. A script tool
 passes parameters as positional arguments, so there is no separate code path.
@@ -163,10 +167,12 @@ until the next full pull. That is the trade a resume makes.
 propy fullpull.py --self-check
 ```
 
-Eleven offline assertions run first, so a network fault cannot mask a logic bug: envelope splitting
-(four quadrants, tiling the parent exactly, spatial reference carried, no invented empty one) and
-the progress file (round trip, a later save not losing an earlier layer, a truncated file and a
-wrong-shaped file both reading as nothing done rather than raising).
+Fifteen offline assertions run first, so a network fault cannot mask a logic bug: envelope splitting
+(four quadrants, tiling the parent exactly, spatial reference carried, no invented empty one), the
+progress file (round trip, a later save not losing an earlier layer, a truncated file and a
+wrong-shaped file both reading as nothing done rather than raising), the parser refusing an
+abbreviated flag, and request pacing (requests at least `DELAY` apart, no sleep at 0, a negative
+`--delay` refused).
 
 The live half then runs against a layer holding more records than its own `maxRecordCount`, the
 shape that breaks a naive pager. It asserts that paging returns every row, that an oversized page

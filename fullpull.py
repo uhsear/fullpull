@@ -22,6 +22,7 @@ line. Command-line arguments win over CONFIG when both are set.
     python fullpull.py                          # uses CONFIG below
     python fullpull.py <service_url> <output_folder>
     python fullpull.py <service_url> <output_folder> --resume
+    python fullpull.py <service_url> <output_folder> --delay 1
     python fullpull.py --self-check
 """
 
@@ -33,6 +34,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 try:
     import arcpy
@@ -89,6 +91,11 @@ MAX_PAGE = 5_000
 TIMEOUT = 180
 RETRIES = 4
 
+# Seconds to wait between the start of one request and the start of the next. 0 sends
+# each request as soon as the last one returns. Set 0.5 or 1 on a public server behind a
+# web application firewall that bans clients for their request rate.
+DELAY = 0.0
+
 # How many times the envelope strategy may subdivide before it stops splitting a cell
 # and fetches that cell by its ID list instead. Only cells that come back full are split,
 # so depth costs nothing on the empty parts of an extent. The cap matters for the case
@@ -115,9 +122,12 @@ SELF_CHECK_LAYER = 0
 # --------------------------------------------------------------------------- http
 
 
-def make_session(retries=None):
+def make_session(retries=None, delay=None):
     """Session with backoff on the transient statuses ArcGIS Server actually emits."""
     s = requests.Session()
+    # Read by rest_get, which paces every request this session makes.
+    s.fullpull_delay = DELAY if delay is None else delay
+    s.fullpull_last = None
     retry = Retry(
         total=RETRIES if retries is None else retries,
         backoff_factor=1.0,
@@ -130,6 +140,16 @@ def make_session(retries=None):
     return s
 
 
+def _pace(session):
+    """Wait until the session's delay has passed since its previous request started."""
+    delay = getattr(session, "fullpull_delay", 0) or 0
+    if delay > 0 and session.fullpull_last is not None:
+        wait = session.fullpull_last + delay - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+    session.fullpull_last = time.monotonic()
+
+
 def rest_get(session, url, params=None, token=None, timeout=None):
     """Fetch an ArcGIS REST resource as JSON.
 
@@ -140,6 +160,7 @@ def rest_get(session, url, params=None, token=None, timeout=None):
     p.setdefault("f", "json")
     if token:
         p["token"] = token
+    _pace(session)
     # Long where clauses / objectIds lists blow past URL length limits; POST is
     # accepted by every ArcGIS Server for /query and is safe for metadata too.
     resp = session.post(url, data=p, timeout=TIMEOUT if timeout is None else timeout)
@@ -697,7 +718,7 @@ def _save_progress(path, done):
 
 
 def download_service(service_url, output_folder, gdb_name=None,
-                     token=None, out_sr=None, where=None, resume=False):
+                     token=None, out_sr=None, where=None, resume=False, delay=None):
     """Download every queryable layer of a service. Returns list of (name, count)."""
     service_url = service_url.rstrip("/")
     where = where or WHERE
@@ -707,7 +728,7 @@ def download_service(service_url, output_folder, gdb_name=None,
 
     # Validate the URL before creating anything on disk, so a typo or a folder URL does
     # not leave an empty geodatabase behind.
-    session = make_session()
+    session = make_session(delay=delay)
     layers, service_max = list_layers(session, service_url, token=token)
     if not layers:
         raise RuntimeError(f"No queryable layers or tables found at {service_url}")
@@ -815,7 +836,43 @@ def _offline_checks():
         refused = True
     assert refused, "a unique prefix of a flag must be refused, not expanded"  # <-- pinned defect
 
-    print("offline checks OK: 11 assertions")
+    # --delay paces requests, and a negative delay is refused rather than ignored.
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {}
+
+    class _Session:
+        fullpull_delay, fullpull_last, starts = 0.2, None, []
+
+        def post(self, url, data=None, timeout=None):
+            self.starts.append(time.monotonic())
+            return _Resp()
+
+    paced = _Session()
+    for _ in range(3):
+        rest_get(paced, "https://example.org/arcgis/rest/services")
+    gaps = [b - a for a, b in zip(paced.starts, paced.starts[1:])]
+    assert all(g >= 0.19 for g in gaps), f"requests must be at least DELAY apart, got {gaps}"
+    unpaced = _Session()
+    unpaced.fullpull_delay, unpaced.starts = 0, []
+    began = time.monotonic()
+    for _ in range(3):
+        rest_get(unpaced, "https://example.org/arcgis/rest/services")
+    assert time.monotonic() - began < 0.1, "a delay of 0 must not sleep"
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            _parser().parse_args(["--delay", "-1"])
+        refused = False
+    except SystemExit:
+        refused = True
+    assert refused, "a negative --delay must be refused"
+    assert _parser().parse_args(["--delay", "0.5"]).delay == 0.5, "--delay must parse seconds"
+
+    print("offline checks OK: 15 assertions")
 
 
 def self_check():
@@ -894,7 +951,17 @@ def _parser():
     ap.add_argument("--self-check", action="store_true", help="Run the live self-check and exit")
     ap.add_argument("--resume", action="store_true",
                     help="Skip layers an earlier interrupted run already finished")
+    ap.add_argument("--delay", type=_seconds, default=None,
+                    help="Seconds between requests, to stay under a server's rate limit "
+                         "(default: DELAY in CONFIG)")
     return ap
+
+
+def _seconds(text):
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("delay must be 0 or more seconds")
+    return value
 
 
 def main(argv=None):
@@ -923,6 +990,7 @@ def main(argv=None):
         out_sr=args.out_sr or OUT_SR or None,
         where=args.where or WHERE,
         resume=args.resume,
+        delay=args.delay,
     )
     return 0
 
