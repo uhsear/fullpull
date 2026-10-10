@@ -57,7 +57,8 @@ the map is missing features.
 - Resume: `--resume` skips layers an interrupted run already finished.
 - Retries with backoff on 429 and 5xx, request timeouts, connection reuse, token support.
 - An optional delay between requests (`--delay` or `DELAY`), for public servers behind a web
-  application firewall that bans clients for their request rate. Off by default.
+  application firewall that bans clients for their request rate. On by default at 0.5 seconds;
+  `--delay 0` turns it off for your own server.
 
 ## The four strategies
 
@@ -123,7 +124,7 @@ WHERE         = "1=1"     # server side row filter
 MAX_PAGE      = 5_000     # ceiling on one page, whatever the service advertises
 TIMEOUT       = 180       # seconds per request
 RETRIES       = 4         # retries with backoff on 429 and 5xx
-DELAY         = 0.0       # seconds between requests; 0.5 to 1 on a rate-limited public server
+DELAY         = 0.5       # seconds between requests; 0 for your own server
 
 MAX_ENVELOPE_DEPTH = 12   # subdivisions before strategy 4 fetches a cell by ID list
 ```
@@ -144,7 +145,7 @@ Flags:
 |---|---|
 | `--self-check` | Run the checks below and exit |
 | `--resume` | Skip layers an earlier interrupted run already finished |
-| `--delay SECONDS` | Wait this long between the start of one request and the next. Overrides `DELAY`. A negative value is refused |
+| `--delay SECONDS` | Wait this long between the start of one request and the next. Overrides `DELAY` (0.5). `--delay 0` turns it off. A negative value is refused |
 
 To use it as an ArcGIS script tool, add it with those six parameters in that order. A script tool
 passes parameters as positional arguments, so there is no separate code path.
@@ -192,7 +193,7 @@ Verified against a live ArcGIS Server 11.3:
 - `objectIdField` can be absent from MapServer layer JSON. Read the OID field from `fields[]` where
   `type` is `esriFieldTypeOID`.
 - `arcpy.conversion.ExportFeatures` accepts a REST URL directly and pages correctly. It is also
-  about 180 times slower, 254s against 1.4s for the same 3,317 records. For one small layer
+  about 180 times slower, 254s against 1.4s for the same 3,317 records, measured with `--delay 0`. For one small layer
   occasionally, use it and skip this.
 - Buffering pages in memory does not scale. Holding 47k polylines before writing peaked at 2.8 GB.
   Converting page by page holds near 0.55 GB.

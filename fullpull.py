@@ -14,7 +14,7 @@ Only an exhausted list fails the layer. --resume skips layers an interrupted run
 
 Why not just hand the REST URL to arcpy.conversion.ExportFeatures, which also works and
 also pages correctly? Measured on Public/PublicWorks/0 (3,317 records): ExportFeatures
-took 254s, this script took 1.4s. Roughly 180x, so the manual paging earns its keep.
+took 254s, this script took 1.4s with no delay (--delay 0). Roughly 180x, so the manual paging earns its keep.
 
 Edit the CONFIG block below and run with no arguments, or pass everything on the command
 line. Command-line arguments win over CONFIG when both are set.
@@ -91,10 +91,11 @@ MAX_PAGE = 5_000
 TIMEOUT = 180
 RETRIES = 4
 
-# Seconds to wait between the start of one request and the start of the next. 0 sends
-# each request as soon as the last one returns. Set 0.5 or 1 on a public server behind a
-# web application firewall that bans clients for their request rate.
-DELAY = 0.0
+# Seconds to wait between the start of one request and the start of the next. On by
+# default, because many public servers sit behind a web application firewall that bans
+# clients for their request rate. It adds half a second per request, and one page holds
+# up to MAX_PAGE rows. Set 0 (or pass --delay 0) for your own server, where speed matters.
+DELAY = 0.5
 
 # How many times the envelope strategy may subdivide before it stops splitting a cell
 # and fetches that cell by its ID list instead. Only cells that come back full are split,
