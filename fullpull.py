@@ -45,6 +45,7 @@ import http.server
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -204,13 +205,13 @@ def rest_get(session, url, params=None, token=None, timeout=None):
     try:
         data = resp.json()
     except ValueError:
-        raise RuntimeError(f"Non-JSON response from {url}: {resp.text[:200]}")
+        raise RuntimeError(scrub(f"Non-JSON response from {url}: {resp.text[:200]}", token))
     if isinstance(data, dict) and "error" in data:
         err = data["error"]
-        raise RuntimeError(
+        raise RuntimeError(scrub(
             f"ArcGIS error {err.get('code')} from {url}: "
-            f"{err.get('message')} {'; '.join(err.get('details') or [])}".strip()
-        )
+            f"{err.get('message')} {'; '.join(err.get('details') or [])}".strip(), token
+        ))
     return data
 
 
@@ -583,6 +584,33 @@ def short_read_verdict(expected, wrote, repeated):
     return None
 
 
+def unread_verdict(current_ids, seen):
+    """Why a finished offset pull is not whole although its count matched, or None.
+
+    current_ids is the server's object id list after the last page. An id the server holds
+    now that no page carried means the layer shifted under the offsets, for example one row
+    deleted and one added during the pull: the count is unchanged and no id repeats, yet a
+    row slid across a page boundary unread. None for current_ids means the list was not
+    obtainable, so the pull cannot be shown whole.
+    """
+    if current_ids is None:
+        return ("the server did not list its object ids, so rows changed during the pull "
+                "cannot be ruled out")
+    have = set(str(i) for i in seen)
+    missing = sorted(i for i in current_ids if str(i) not in have)
+    if missing:
+        return ("%d row(s) the server holds now were never read (first id %s), so the layer "
+                "changed while it was being pulled" % (len(missing), missing[0]))
+    return None
+
+
+def current_ids(session, layer_url, where, token=None):
+    """The server's object ids for `where` right now, or None when it gives no list."""
+    ids = rest_get(session, f"{layer_url}/query",
+                   {"where": where, "returnIdsOnly": "true"}, token=token).get("objectIds")
+    return ids if isinstance(ids, list) else None
+
+
 def note_ids(page, oid, seen):
     """Add a page's objectIds to `seen`. Returns how many were already there.
 
@@ -780,26 +808,30 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
             "resultOffset paging",
             lambda: iter_pages(session, layer_url, size, oid, expected,
                                token=token, geom=geom, where=where),
+            True,
         ))
     strategies.append((
         "objectId list",
         lambda: iter_pages_by_oid(session, layer_url, size,
                                   token=token, geom=geom, where=where),
+        False,
     ))
     strategies.append((
         "objectId range",
         lambda: iter_pages_by_oid_range(session, layer_url, size, oid,
                                         token=token, geom=geom, where=where),
+        False,
     ))
     if meta.get("geometryType"):
         strategies.append((
             "envelope quadtree",
             lambda: iter_pages_by_envelope(session, layer_url, size, oid, meta,
                                            token=token, geom=geom, where=where),
+            False,
         ))
 
     got, failures = None, []
-    for index, (label, open_pages) in enumerate(strategies):
+    for index, (label, open_pages, shifts) in enumerate(strategies):
         tmpdir = tempfile.mkdtemp(prefix="restdl_")
         try:
             # Each attempt starts from an empty staging class. A half-written attempt
@@ -815,6 +847,13 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
                 raise RuntimeError(f"server reported {expected} records but returned none")
             count = int(arcpy.management.GetCount(staging)[0])
             problem = short_read_verdict(expected, count, repeated)
+            # Offsets count rows from the top, so an edit made mid-pull can shift a row
+            # across a page boundary with the count unchanged. The other strategies name
+            # their rows or windows by id, which an edit cannot shift. Without an OID field
+            # there is nothing to compare, which the README names.
+            if not problem and shifts and oid:
+                problem = unread_verdict(current_ids(session, layer_url, where, token),
+                                         seen_ids)
             if problem:
                 raise RuntimeError(problem)
         except Exception as exc:
@@ -909,6 +948,7 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
     path = os.path.join(folder, "%s_%s" % (info["id"], safe_filename(info.get("name"))))
     part = path + ".part"
     got = 0
+    _pace(session)
     try:
         resp = session.get(url, params={"token": token} if token else None, stream=True,
                            headers={"Accept-Encoding": "identity"}, timeout=TIMEOUT)
@@ -1056,6 +1096,14 @@ def download_service(service_url, output_folder, gdb_name=None,
                      token=None, out_sr=None, where=None, resume=False, attachments=False,
                      delay=None, allow_uncounted=False):
     """Download every queryable layer of a service. Returns list of (name, count)."""
+    if urlparse(service_url).query or urlparse(service_url).fragment:
+        # A token pasted from a browser address bar would become part of the geodatabase
+        # name, the progress file name and every error message, all written to disk or a log.
+        raise RuntimeError(
+            "The service URL has a query string or fragment (everything after a ? or #). "
+            "Remove it, and pass any token through the FULLPULL_TOKEN environment variable "
+            "or standard input (token argument -)."
+        )
     service_url = service_url.rstrip("/")
     where = where or WHERE
     output_folder = os.path.abspath(output_folder)
@@ -1370,6 +1418,8 @@ class _Stub(object):
         if p.get("returnCountOnly") == "true":
             return {} if f.get("no_count") else {"count": len(rows)}
         if p.get("returnIdsOnly") == "true":
+            if f.get("ids_absent"):
+                return {}
             if f.get("ids_fail") == "all" or (f.get("ids_fail") and not p.get("geometry")):
                 return _ERR
             ids = [str(r["oid"]) if f.get("ids_str") else r["oid"] for r in rows]
@@ -1394,6 +1444,12 @@ class _Stub(object):
             if not f.get("extent_nosr"):
                 env["spatialReference"] = {"wkid": 2237}
             return {"extent": env}
+        if f.get("race") and not f.get("raced") and p.get("resultOffset") == "1000":
+            # Another editor deletes the first row after page one is read, and perhaps adds one.
+            f["raced"] = True
+            layer.rows = [r for r in layer.rows if r["oid"] != 1]
+            if f["race"] == "swap":
+                layer.rows.append({"oid": 90001, "x": 1.0, "y": 1.0, "geom": True})
         start = 0 if (f.get("ignore_offset") or p.get("objectIds")) \
             else int(p.get("resultOffset") or 0)
         size = min(int(p.get("resultRecordCount") or layer.cap), layer.cap)
@@ -1735,6 +1791,11 @@ def _http_checks(t, env):
     raises(lambda: rest_get(s, misc + "errbody"),
            "a 200 answer carrying an error body is a failure  <-- pinned defect",
            text="ArcGIS error 400 from")
+    for leaky in ("notjson", "errbody"):
+        msg = raises(lambda: rest_get(s, misc + leaky + "?token=SECRET%2Btok", token="SECRET+tok"),
+                     "a %s failure raised for a URL that carries the token" % leaky)
+        check("SECRET" not in msg and "<token>" in msg,
+              "the %s message never echoes the token, in either form  <-- pinned defect" % leaky)
     raises(lambda: rest_get(s, misc + "errplain"), "an error body with no details is still named",
            text="ArcGIS error 500")
     raises(lambda: rest_get(s, misc + "http500"), "an HTTP 500 raises", exc=requests.HTTPError)
@@ -1850,6 +1911,24 @@ def _strategy_checks(t, env):
     check("came back twice" in fake.warnings[0] and "resultOffset paging" in fake.warnings[0],
           "the fallback names the strategy that failed and why, because a repeated page whose "
           "count matches is refused  <-- pinned defect")
+
+    (name, count), gdb = env.pull(_Layer(n=2500, race="swap"))
+    oids = {r["attributes"]["OBJECTID"] for r in fake.classes[os.path.join(gdb, name)]}
+    check(count == 2500 and 1001 in oids and 90001 in oids and 1 not in oids
+          and "never read" in fake.warnings[0] and "resultOffset paging" in fake.warnings[0],
+          "one row deleted and one added mid-pull keeps the count but shifts a row across a "
+          "page; it is refused and refetched by id, never accepted short  <-- pinned defect")
+    raises(lambda: env.pull(_Layer(n=2500, race="delete")),
+           "one row deleted mid-pull is refused on every strategy", text="downloaded 2499 of 2500")
+    (name, count), gdb = env.pull(_Layer(n=100, ids_absent=True))
+    check(count == 100 and "did not list its object ids" in fake.warnings[0],
+          "a server that will not list its ids cannot show an offset pull whole, so the range "
+          "windows take over  <-- pinned defect")
+    check(unread_verdict([1, 2, "3"], {1, 2, 3}) is None,
+          "an id list the pages all covered, in either number form, is whole")
+    check("never read (first id 7)" in unread_verdict([9, 7], {1}),
+          "an id no page carried is named")
+    check(unread_verdict([1], {1, 2}) is None, "a row deleted during the pull is not an unread row")
 
     seed = {"seed": ["old"]}
     msg = raises(lambda: env.pull(_Layer(n=100, hide={98, 99, 100}), seed=seed),
@@ -2001,6 +2080,16 @@ def _files(folder):
 def _attachment_checks(t, env):
     """Attachment batches: whole, short, overflowing, and every way a body can be cut."""
     check, raises, stub = t.check, t.raises, env.stub
+
+    stub.layers = {0: _att_layer(n=14, every=7, per=1)}
+    slow, began = make_session(retries=0, delay=0.2), time.monotonic()
+    for parent, (serial, fname, data) in ((7, stub.layers[0].att[7][0]),
+                                          (14, stub.layers[0].att[14][0]), (7, stub.layers[0].att[7][0])):
+        download_attachment(slow, env.base + "/0", parent,
+                            {"id": serial, "name": fname, "size": len(data)},
+                            tempfile.mkdtemp(dir=env.root))
+    check(time.monotonic() - began >= 0.35,
+          "attachment downloads obey --delay like every other request  <-- pinned defect")
 
     layer = _att_layer()
     truth = sum(len(v) for v in layer.att.values())
@@ -2198,6 +2287,13 @@ def _service_checks(t, env):
     stub.token = None
     stub.extra = []
 
+    held = sorted(os.listdir(folder))
+    for tail in ("?token=SECRETTOKEN123", "#SECRETTOKEN123"):
+        msg = raises(lambda: download_service(env.base + tail, folder, token="SECRETTOKEN123"),
+                     "a service URL with a query string or fragment is refused  <-- pinned defect",
+                     text="query string or fragment")
+        check("SECRETTOKEN123" not in msg and sorted(os.listdir(folder)) == held,
+              "the refusal neither echoes the token nor writes a geodatabase or progress file")
     raises(lambda: download_service(env.base, os.path.join(folder, "nope")),
            "a missing output folder is refused", text="does not exist")
     raises(lambda: download_service(env.root_url + "/misc/nolayers", folder),
@@ -2227,6 +2323,9 @@ def _cli_checks(t, env):
     with _swapped("ALLOW_UNCOUNTED_ATTACHMENTS", True):
         check(main([env.base, folder, "unc2.gdb", "--attachments"]) == 0,
               "the CONFIG switch accepts an uncounted attachment server too")
+    check(_exit_code(lambda: _parser().parse_args(["--delay", "nan"])) == 2
+          and _exit_code(lambda: _parser().parse_args(["--delay", "inf"])) == 2,
+          "a delay that is not a finite number is refused, not read as no pacing  <-- pinned defect")
     stub.layers = {0: _Layer(n=12)}
     tok = "env+tok/1="
     stub.token = tok
@@ -2369,8 +2468,8 @@ def _parser():
 
 def _seconds(text):
     value = float(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError("delay must be 0 or more seconds")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("delay must be a finite number of 0 or more seconds")
     return value
 
 

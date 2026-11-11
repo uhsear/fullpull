@@ -87,11 +87,17 @@ verdict, `--resume`, and the attachment checks above.
 - `--resume` skips layers an interrupted run finished. A layer finished without attachments is not
   skipped by a run that asks for them.
 - Retries with backoff on 429 and 5xx, request timeouts, token support. The token travels in the
-  POST body of every query, and in the URL only for the GET of an attachment, where it is scrubbed
-  from any error message.
+  POST body of every query, and in the URL only for the GET of an attachment. It is scrubbed from
+  the attachment error messages and from the non-JSON and ArcGIS error messages.
 - An optional delay between requests (`--delay` or `DELAY`), for public servers behind a web
   application firewall that bans clients for their request rate. On by default at 0.5 seconds;
   `--delay 0` turns it off for your own server.
+- A pull by resultOffset is checked again at the end against the server's current object id list,
+  because an edit made mid-pull (one row deleted, one added) can keep the count and shift a row
+  across a page boundary unread. An id the server holds that no page carried refuses that strategy,
+  and the next one fetches by id.
+- A service URL with a query string or fragment, such as a token pasted from a browser address bar,
+  is refused before anything is written, and the message does not echo it.
 - A layer the server now counts as empty, while the geodatabase still holds rows for it, is refused
   rather than left stale. A layer with no old copy completes with a warning.
 
@@ -159,8 +165,11 @@ skipped. A run that fails on an attachment fails its layer and does not record i
 - `queryAttachments` takes `objectIds`, returns `attachmentGroups` with `parentObjectId` and
   `attachmentInfos` (`id`, `name`, `contentType`, `size`). It also supports `returnCountOnly`, but
   the page says so for hosted feature services only, from 10.9.1, and only when the layer's
-  `supportsQueryAttachmentsCountOnly` property under `advancedQueryCapabilities` is true. The page
-  does not say whether a feature with no attachments appears in the list.
+  `supportsQueryAttachmentsCountOnly` property under `advancedQueryCapabilities` is true. For the
+  count form the page says it "only returns results for features matching the query criteria that
+  have a non-zero number of attachments", which is why a feature missing from a count answer is read
+  as having none (`counts.get(parent, 0)`). For the list form the page does not say whether a
+  feature with no attachments appears.
   [Query Attachments](https://developers.arcgis.com/rest/services-reference/enterprise/query-attachments-feature-service-layer/)
 - An attachment is downloaded from `<layer>/<featureId>/attachments/<attachmentId>`.
   [Attachment](https://developers.arcgis.com/rest/services-reference/enterprise/attachment-feature-service/)
@@ -176,8 +185,9 @@ skipped. A run that fails on an attachment fails its layer and does not record i
   true. When `outSR` is not given, the geometry comes back in the map's spatial reference, which is
   why fullpull pins `outSR`. `returnExtentOnly` is supported when `supportsReturningQueryExtent` is
   true, which fullpull does not read: it tries the request and falls back to the published extent.
-  `outStatistics` takes `MIN` and `MAX`. The page shows `"exceededTransferLimit" : true` in a
-  response and `false` only in an example, so fullpull does not rely on `false` to mark a last page.
+  `outStatistics` takes `MIN` and `MAX`. fullpull does not rely on `exceededTransferLimit` to mark
+  a last page: an offset pull ends on the server's own count, or on an empty page, and the count is
+  then checked.
   [Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)
 - `Append` with `NO_TEST` does not require the fields of the input to match the target, and fields
   that do not match are not mapped unless a field map says so.
@@ -252,7 +262,12 @@ A unique prefix of a flag is refused, so `--attach` is an error and not `--attac
 Give the token in the `FULLPULL_TOKEN` environment variable, or give `-` as the token argument to
 read it from standard input. A token typed as an argument shows in the process list and the shell
 history, and one pasted into `TOKEN` sits in a file that may be committed. The order of precedence is
-the argument, then `FULLPULL_TOKEN`, then `TOKEN`.
+the argument, then `FULLPULL_TOKEN`, then `TOKEN`. Do not leave the token on the service URL: a URL
+with a query string or fragment is refused. In an ArcGIS Pro script tool, set `FULLPULL_TOKEN` and
+leave the token parameter empty. Esri's geoprocessing history page says history keeps a tool's
+parameter settings and does not say it masks them, so a token typed into a parameter may be saved
+with the project.
+[Geoprocessing history](https://doc.esri.com/en/arcgis-pro/latest/help/analysis/geoprocessing/basics/geoprocessing-history.html)
 
 To use it as an ArcGIS script tool, add it with the six positional parameters in that order. A script
 tool passes parameters as positional arguments, so there is no separate code path. Flags are for the
@@ -290,9 +305,15 @@ PASS  a repeated page is refused although the count matches  <-- pinned defect
 ...
 PASS  an attachment id of '../../x' is refused, so no id can steer a file or a URL  <-- pinned defect
 ...
+PASS  the notjson message never echoes the token, in either form  <-- pinned defect
+...
+PASS  one row deleted and one added mid-pull keeps the count but shifts a row across a page; it is refused and refetched by id, never accepted short  <-- pinned defect
+...
 PASS  a server that returns no count is refused, not trusted  <-- pinned defect
 ...
 PASS  a server that counts 0 while the old copy holds rows is refused, not kept stale on exit 0  <-- pinned defect
+...
+PASS  attachment downloads obey --delay like every other request  <-- pinned defect
 ...
 PASS  a list that drops a feature the server counts is refused  <-- pinned defect
 ...
@@ -312,15 +333,19 @@ PASS  the token reaches no message, warning, error, progress file or output file
 ...
 PASS  a resume that wants attachments does not skip a layer finished without them  <-- pinned defect
 ...
+PASS  a service URL with a query string or fragment is refused  <-- pinned defect
+...
+PASS  a delay that is not a finite number is refused, not read as no pacing  <-- pinned defect
+...
 PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 ...
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-194 assertions, 0 failed
+210 assertions, 0 failed
 ```
 
-The full run prints all 194 assertions. Each `...` line is where this block is cut.
+The full run prints all 210 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -336,11 +361,11 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`) | 194 |
-| Windows, ArcGIS conda env | 3.13.7 | 194 |
-| Windows, venv | 3.9.25 | 194 |
-| Windows, venv | 3.12.10 | 194 |
-| Linux | 3.12.3 | 194 |
+| Windows | 3.13.2 (`C:\Python313`) | 210 |
+| Windows, ArcGIS conda env | 3.13.7 | 210 |
+| Windows, venv | 3.9.25 | 210 |
+| Windows, venv | 3.12.10 | 210 |
+| Linux | 3.12.3 | 210 |
 
 The counts are equal because the self-check never calls the real arcpy. On the Windows ArcGIS
 environment `import arcpy` raised `RuntimeError: The Product License has not been initialized` during
@@ -354,7 +379,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,334 statements with none missed and 370 branches with none partial, 100 percent, on the
+reports 1,380 statements with none missed and 390 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -374,7 +399,9 @@ attachment id that is not checked as an integer, progress entries that are not f
 count form read as "cannot count", the opt-in check removed, a stale copy kept on a count of 0, a
 null extent not guarded, a layer id not checked, the environment token ignored, a licence error
 reported as a missing arcpy, feature ids not checked, the count capability ignored, no request
-pacing, and the licence text dropped.
+pacing, and the licence text dropped. A third round turned it red for five more: the end-of-pull id
+check off, attachment downloads not paced, the query-string refusal off, the token left in the
+non-JSON message, and a delay of NaN accepted.
 
 ## Claims and where each was exercised
 
@@ -397,7 +424,9 @@ pacing, and the licence text dropped.
 | An uncounted attachment server, a 5xx on the count form, an id that is not an integer | stub with each fault in turn, `main()` with and without the opt-in |
 | Token from `FULLPULL_TOKEN` or standard input | `main()` against a stub that demands a token |
 | An empty server count over an old copy with rows is refused | stub layer with 0 rows over a seeded class |
-| Requests are paced | assertions on the gap between request starts, and no sleep at 0 |
+| Requests are paced, attachment downloads included | assertions on the gap between request starts, on three timed downloads, and no sleep at 0 |
+| A row shifted across a page by a delete plus an add is not accepted | stub that deletes one row and adds one after page one; the next strategy refetches by id |
+| A token on the service URL is refused and never echoed | `download_service` against the stub with `?token=` and `#` tails; messages and the output folder scanned |
 
 ## Limits
 
@@ -413,8 +442,11 @@ pacing, and the licence text dropped.
 - **No counts, hidden cap.** When a server cannot answer `returnCountOnly`, a batch is checked only
   against the record cap the layer advertises. A server that cuts an answer short of that cap would
   pass. Lower `ATTACH_BATCH` to shrink the answers. There is no complete fix without counts.
-- **The row count is read once, before the pull.** Rows added or deleted during the pull make the
-  count disagree, so the layer is refused and retried by the next strategy. It is never accepted.
+- **The row count is read once, before the pull.** Rows deleted or added during the pull make the
+  count disagree, or, for a pull by `resultOffset`, leave an id the server now holds unread; either
+  way that strategy is refused and the next one tries. The id check covers the offset strategy only,
+  and needs an OID field. The other three name rows or windows by id, which an edit cannot shift.
+  A layer edited constantly can fail every strategy and need a retry.
 - **Repeats need an objectId.** A feature with no value for the OID field is not tracked, so for
   such a layer the count is the only check. A layer whose OID values are not unique is refused.
 - **The unit of `size` in the attachment list is not stated on its own page.** The Query
@@ -438,8 +470,9 @@ pacing, and the licence text dropped.
 - **Resume does not record the filter, spatial reference or service.** A layer finished with one
   `--where` is skipped by a later resume with another. Use one output geodatabase per service and
   per filter.
-- **Exit code 1 covers both a refused layer and a crash.** The message says which. Argument errors
-  exit 2.
+- **Exit code 1 covers a refused layer, a crash, a missing arcpy and a licence failure.** Only the
+  message says which, so a scheduled job cannot tell "tool failed" from "findings exist" by the code
+  alone. Argument errors exit 2.
 - **The token goes wherever a redirect sends it.** If the server answers a POST with a 307 or 308,
   `requests` re-sends the body, token included, to the new host. Give fullpull the final https URL.
 - **The attachment download puts the token in the URL.** It can appear in the server's own access
@@ -448,18 +481,44 @@ pacing, and the licence text dropped.
 - **A service URL with `http://` sends the token in clear text.** The tool neither refuses nor
   warns. Use https.
 - **A non-JSON answer is quoted in the error.** The first 200 characters of the body go into the
-  message. A proxy that echoes the request would echo the token there. Scrubbing covers only the
-  attachment GET.
+  message with the token removed. Other server text that reaches a message or a traceback, such as
+  the ArcGIS error details, is not otherwise scrubbed, and an uncaught failure prints a Python
+  traceback.
 - **A non-standard service URL** with no `/services/` segment makes the default geodatabase name from
   the whole URL, host and port included. Pass a name.
 - **A layer with no extent** gets no `outSR` from its extent. It is then asked for geometry in the
   map's spatial reference unless you pass an out SR.
 - **Paging while the data changes.** Esri's Query page does not say that `resultOffset` pages stay
-  stable while the data is edited. A shifted page shows up as a repeat or a short count and refuses.
+  stable while the data is edited. A shifted page shows up as a repeat, a short count or, by the end-of-pull id check, an unread id, and refuses.
 - **Attachment folders are not cleaned.** Files from an earlier run stay.
 - **`f`-strings remain.** This file predates the house style of `%` formatting and still holds
   f-strings in the code that dates from the original build. It runs on Python 3.9 and later.
-- **`--self-check`, not `--self-test`.** The flag keeps its original name.
+- **`--self-check`, not `--self-test`.** The flag keeps its original name. `--self-test` exits 2 as
+  an unrecognised argument, so a mechanical check that calls it will not pass.
+- **There is no `--apply`, and the rule is open.** House style says only `--apply` writes. This tool
+  writes on every run, and the owner has to either add the flag or accept the exception in writing.
+- **Name collisions are suffixed within one run only.** A second service pulled into the same
+  explicit geodatabase name replaces same-named layers from the first.
+- **A layer JSON that omits `hasAttachments`**, as a server before 10.1 does, is read as having no
+  attachments. With `--attachments` the run says so and exits 0 without being able to tell.
+- **Layer types other than Feature Layer and Table** are skipped as non-queryable with exit 0 and a
+  message. Whether an Annotation Layer should be pulled was not checked against Esri's layer-type
+  documentation.
+- **A `parentObjectId` that is a list** in an attachment answer raises a `TypeError` that fails only
+  that layer. Real servers return an integer.
+- **An attachment-free batch can count as checked against counts.** A server that ignores
+  `returnCountOnly` answers an attachment-free batch with an empty group list, as Esri's SF311 sample
+  does, so the `by_count` figure in the run message can overstate the evidence on such a stretch. The
+  verdict holds, because the first batch with attachments flips the layer to "cannot count".
+- **The attachment download follows redirects to any host the server names.** That serves blob
+  storage. The token is not forwarded, because it sits only in the first query string, but a hostile
+  server can make the client request any URL, an internal one included.
+- **Several relied-on behaviours have no Esri citation here:** `orderByFields` with `resultOffset`,
+  the defaults of `returnZ` and `returnM`, and the arcpy tools `JSONToFeatures`, `Rename`,
+  `CreateFileGDB`, `GetCount`, `CreateUniqueName`, `ValidateTableName` and `Exists`.
+- **The numbers under "Notes from the original build"** are from one earlier run on a server that is
+  not named here. The 254 s against 1.4 s figure in the file's docstring has the same status. They
+  were not measured again.
 - **Related tables, coded value domains, date time zones, parallel fetching** are not handled.
   Conversion, not HTTP, is the bottleneck and `arcpy` is not thread safe.
 
