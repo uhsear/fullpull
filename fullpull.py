@@ -16,35 +16,47 @@ Why not just hand the REST URL to arcpy.conversion.ExportFeatures, which also wo
 also pages correctly? Measured on Public/PublicWorks/0 (3,317 records): ExportFeatures
 took 254s, this script took 1.4s. Roughly 180x, so the manual paging earns its keep.
 
+A short read is refused, never accepted. The rows written are compared with the server's
+own count, rows that came back twice are refused even when the count matches by accident,
+and a server that returns no count at all is refused because completeness cannot be shown.
+--attachments pulls the attachment files too, and refuses a batch of features whose
+attachment list came back short of the server's own per-feature count.
+
 Edit the CONFIG block below and run with no arguments, or pass everything on the command
 line. Command-line arguments win over CONFIG when both are set.
 
     python fullpull.py                          # uses CONFIG below
     python fullpull.py <service_url> <output_folder>
     python fullpull.py <service_url> <output_folder> --resume
+    python fullpull.py <service_url> <output_folder> --attachments
     python fullpull.py --self-check
+    python fullpull.py --self-check-live        # the same layer checks against SELF_CHECK_URL
 """
 
 import argparse
 import contextlib
+import gzip
+import http.server
 import io
 import json
 import os
+import re
 import shutil
+import socketserver
 import sys
 import tempfile
+import threading
+import time
+import types
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import arcpy
-except ModuleNotFoundError:
-    # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install.
-    # Without this, a first run on the wrong interpreter is an opaque import error.
-    sys.exit(
-        "arcpy was not found. Run this with the Python that ships with ArcGIS Pro:\n"
-        r'  "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" '
-        "fullpull.py\n"
-        r"or the propy.bat in ...\Pro\bin\Python\Scripts\."
-    )
+except (ImportError, RuntimeError):
+    # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install, and it
+    # raises RuntimeError when Pro is installed but its licence is not initialised. The
+    # import must not kill --self-check, which runs on a stand-in. A real pull exits in main().
+    arcpy = None
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -98,9 +110,17 @@ RETRIES = 4
 # Only the last-resort strategy uses this; the three before it never subdivide.
 MAX_ENVELOPE_DEPTH = 12
 
-# Layer the --self-check exercises. Defaults to Esri's public sample server, which exists
-# for this purpose. Point it at your own server rather than sending test traffic to
-# someone else's production service. Two constraints, or the check proves nothing:
+# How many features one attachment query asks about, with --attachments. The query returns
+# one group per feature that has attachments, so a batch can never legitimately hold more
+# groups than this. Kept below the layer's own page size so a batch cannot reach the cap
+# the server truncates at. Smaller batches cost more requests and verify just as strictly.
+ATTACH_BATCH = 100
+
+# Layer --self-check-live exercises. --self-check itself never leaves the machine: it runs
+# the same layer checks against a stub server it starts on 127.0.0.1. This one defaults to
+# Esri's public sample server, which exists for this purpose. Point it at your own server
+# rather than sending test traffic to someone else's production service. Two constraints,
+# or the check proves nothing:
 # the layer's record count must exceed its maxRecordCount, and that maxRecordCount must
 # be below 5000 (otherwise the naive-stride assertion cannot demonstrate the bug).
 # SF311 layer 0: 9,687 records, maxRecordCount 1000.
@@ -491,6 +511,119 @@ def iter_pages_by_envelope(session, layer_url, size, oid, meta,
             yield {**page, "features": fresh}
 
 
+# ------------------------------------------------------------ the pure decision core
+
+
+def short_read_verdict(expected, wrote, repeated):
+    """Why a pull is not whole, or None when it is.
+
+    expected is the server's own record count. wrote is the row count read back from the
+    staging class, not the number of rows the pages carried, so a row the conversion
+    dropped counts as missing. repeated is how many rows came back with an objectId already
+    seen. A repeat is refused even when wrote equals expected: that is the page that was
+    served twice, and the rows it displaced were never read.
+    """
+    if repeated:
+        return (
+            "%d row(s) came back twice, so the pages overlap and only %d distinct of the "
+            "server's %d records were read" % (repeated, wrote - repeated, expected)
+        )
+    if wrote < expected:
+        return "downloaded %d of %d records, %d short" % (wrote, expected, expected - wrote)
+    if wrote > expected:
+        return "downloaded %d records but the server counted %d" % (wrote, expected)
+    return None
+
+
+def note_ids(page, oid, seen):
+    """Add a page's objectIds to `seen`. Returns how many were already there.
+
+    A feature with no value for the OID field cannot be tracked, so it is not counted. That
+    leaves the count comparison as the only check for such a layer, which the README names.
+    """
+    repeats = 0
+    for feat in page.get("features") or []:
+        value = (feat.get("attributes") or {}).get(oid) if oid else None
+        if value is None:
+            continue
+        if value in seen:
+            repeats += 1
+        seen.add(value)
+    return repeats
+
+
+def safe_filename(name):
+    """A file name that cannot leave its folder, whatever the server called the attachment."""
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", name if isinstance(name, str) else "")
+    clean = clean.lstrip(".")[:100]
+    return clean or "attachment"
+
+
+def file_problem(declared, content_length, got):
+    """Why a downloaded attachment body is short, or None.
+
+    Esri's page for the attachment infos resource shows `size` with no unit, so a body longer
+    than `size` is not refused: only a body shorter than the server lists can mean lost bytes.
+    Content-Length is the transport's own claim. It is skipped when the body was compressed in
+    transit, because the length on the wire is then not the length written.
+    """
+    if content_length is not None and got != content_length:
+        return "body was %d bytes but Content-Length said %d" % (got, content_length)
+    if isinstance(declared, int) and got < declared:
+        return "got %d bytes of the %d the server lists" % (got, declared)
+    return None
+
+
+def attachment_batch_problems(batch, groups, counts, cap):
+    """Reasons a queryAttachments answer for `batch` cannot be trusted. [] means whole.
+
+    counts maps a feature to the number of attachments the server itself says it has, from
+    the returnCountOnly form of the same query, or is None when the server cannot answer that.
+    With counts, every feature is compared. Without, the only evidence of truncation is the
+    answer reaching the server's own record cap, so that is refused.
+    """
+    if not isinstance(groups, list):
+        return ["attachmentGroups is not a list"]
+    wanted = set(batch)
+    seen, problems = {}, []
+    for group in groups:
+        group = group if isinstance(group, dict) else {}
+        parent = group.get("parentObjectId")
+        infos = group.get("attachmentInfos")
+        if parent not in wanted:
+            problems.append("a group for feature %r came back that was never asked for" % (parent,))
+        elif parent in seen:
+            problems.append("feature %s came back twice" % parent)
+        elif not isinstance(infos, list) or any(
+                not isinstance(i, dict) or i.get("id") is None for i in infos):
+            problems.append("feature %s has an attachment with no id" % parent)
+        else:
+            seen[parent] = infos
+    if counts is None:
+        total = sum(len(v) for v in seen.values())
+        if len(groups) >= cap or total >= cap:
+            problems.append(
+                "the answer reached the server cap of %d, so it may be cut off" % cap
+            )
+        return problems
+    for parent in sorted(wanted | set(counts)):
+        said, got = counts.get(parent, 0), len(seen.get(parent, []))
+        if said != got:
+            problems.append(
+                "feature %s: the server counts %d attachment(s), the query listed %d"
+                % (parent, said, got)
+            )
+    return problems
+
+
+def scrub(text, token):
+    """`text` with the token removed, in both the form it was sent and the URL-encoded form."""
+    text = str(text)
+    for form in {token, quote(token or "", safe="")} - {"", None}:
+        text = text.replace(form, "<token>")
+    return text
+
+
 # ---------------------------------------------------------------------- ingestion
 
 
@@ -549,6 +682,13 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
         session, f"{layer_url}/query",
         {"where": where, "returnCountOnly": "true"}, token=token,
     ).get("count")
+    # No count means nothing to verify against. Accepting whatever arrives would be the
+    # false clean this tool exists to prevent, so a layer the server cannot count is refused.
+    if not isinstance(expected, int):
+        raise RuntimeError(
+            "%s: the server returned no record count, so completeness cannot be verified; "
+            "refusing the layer" % layer["name"]
+        )
 
     name = unique_name(layer["name"], gdb, taken)
     target = os.path.join(gdb, name)
@@ -615,13 +755,16 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
             # a duplicate-laden success.
             if arcpy.Exists(staging):
                 arcpy.management.Delete(staging)
+            seen_ids, repeated = set(), 0
             for seq, page in enumerate(open_pages()):
+                repeated += note_ids(page, oid, seen_ids)
                 _write_page(page, staging, tmpdir, seq)
             if not arcpy.Exists(staging):
                 raise RuntimeError(f"server reported {expected} records but returned none")
             count = int(arcpy.management.GetCount(staging)[0])
-            if expected is not None and count != expected:
-                raise RuntimeError(f"downloaded {count} of {expected} records")
+            problem = short_read_verdict(expected, count, repeated)
+            if problem:
+                raise RuntimeError(problem)
         except Exception as exc:
             failures.append(f"{label}: {exc}")
             if arcpy.Exists(staging):
@@ -651,6 +794,123 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
     arcpy.management.Rename(staging, target)
 
     return name, got
+
+
+# ------------------------------------------------------------------- attachments
+
+
+def fetch_attachment_infos(session, layer_url, batch, cap, tally, token=None):
+    """[(feature, info)] for every attachment of the features in `batch`, or raises.
+
+    Asks queryAttachments for the batch, then asks the same question with returnCountOnly,
+    which Esri documents from 10.9.1 for hosted services. A batch whose list disagrees with
+    the server's own per-feature counts is split in two and asked again, because a smaller
+    batch cannot overflow a cap the larger one hit. A single feature that still disagrees
+    raises: its attachments cannot be shown to be complete.
+    """
+    url = f"{layer_url}/queryAttachments"
+    ids = ",".join(str(x) for x in batch)
+    groups = rest_get(session, url, {"objectIds": ids}, token=token).get("attachmentGroups")
+    counts = None
+    if not tally["counts_unsupported"]:
+        try:
+            counted = rest_get(session, url, {"objectIds": ids, "returnCountOnly": "true"},
+                               token=token).get("attachmentGroups")
+            counts = {g["parentObjectId"]: int(g["count"]) for g in counted}
+        except Exception:
+            # An older or non-hosted service errors on this form, or ignores it and answers
+            # with full lists that carry no count. Remember that, so the rest of the layer
+            # does not repeat a request that cannot succeed, and fall back to the cap rule,
+            # which the summary then reports as the weaker evidence.
+            tally["counts_unsupported"] = True
+    problems = attachment_batch_problems(batch, groups, counts, cap)
+    if not problems:
+        tally["by_count" if counts is not None else "by_cap"] += 1
+        return [(g["parentObjectId"], info) for g in groups for info in g["attachmentInfos"]]
+    if len(batch) == 1:
+        raise RuntimeError("attachments of feature %s cannot be shown complete: %s"
+                           % (batch[0], "; ".join(problems)))
+    mid = len(batch) // 2
+    return (fetch_attachment_infos(session, layer_url, batch[:mid], cap, tally, token)
+            + fetch_attachment_infos(session, layer_url, batch[mid:], cap, tally, token))
+
+
+def download_attachment(session, layer_url, parent, info, folder, token=None):
+    """Write one attachment to `folder` and return its size. Raises on a short body.
+
+    The token is sent as a query parameter, because the attachment resource is a GET, so a
+    failure message is scrubbed before it is raised: requests puts the whole URL in it.
+    """
+    url = f"{layer_url}/{parent}/attachments/{info['id']}"
+    path = os.path.join(folder, "%s_%s" % (info["id"], safe_filename(info.get("name"))))
+    part = path + ".part"
+    got = 0
+    try:
+        resp = session.get(url, params={"token": token} if token else None, stream=True,
+                           headers={"Accept-Encoding": "identity"}, timeout=TIMEOUT)
+        with contextlib.closing(resp):
+            resp.raise_for_status()
+            with open(part, "wb") as fh:
+                for chunk in resp.iter_content(65536):
+                    fh.write(chunk)
+                    got += len(chunk)
+            length = resp.headers.get("Content-Length")
+            if resp.headers.get("Content-Encoding") or not (length or "").isdigit():
+                length = None
+        problem = file_problem(info.get("size"), None if length is None else int(length), got)
+        if problem:
+            raise RuntimeError(problem)
+        os.replace(part, path)
+    except (requests.RequestException, RuntimeError) as exc:
+        raise RuntimeError("attachment %s of feature %s: %s"
+                           % (info["id"], parent, scrub(exc, token)))
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    return got
+
+
+def pull_attachments(session, service_url, layer, name, gdb, expected, token=None, where="1=1"):
+    """Download the attachments of a layer. Returns a summary dict, or None for a layer with none.
+
+    The feature list comes from the server, and it must be exactly as long as the verified
+    row count: a short ID list would hide whole features from the attachment pass. Then every
+    batch is checked as described at fetch_attachment_infos, and every file against its size.
+    """
+    layer_url = f"{service_url}/{layer['id']}"
+    meta = rest_get(session, layer_url, token=token)
+    if not meta.get("hasAttachments"):
+        return None
+    if not (meta.get("advancedQueryCapabilities") or {}).get("supportsQueryAttachments"):
+        raise RuntimeError(
+            f"{layer['name']}: the layer has attachments but the server does not advertise "
+            "supportsQueryAttachments, so they cannot be listed in batches; refusing rather "
+            "than skipping them"
+        )
+    ids = sorted(rest_get(
+        session, f"{layer_url}/query",
+        {"where": where, "returnIdsOnly": "true"}, token=token,
+    ).get("objectIds") or [])
+    if len(ids) != expected:
+        raise RuntimeError(
+            f"{layer['name']}: the feature list holds {len(ids)} ids for {expected} rows, so "
+            "some features would never be asked about their attachments"
+        )
+    cap = page_size(meta, None)
+    step = max(1, min(ATTACH_BATCH, cap - 1))
+    tally = {"counts_unsupported": False, "by_count": 0, "by_cap": 0}
+    root = os.path.join(gdb + ".attachments", name)
+    files, parents = 0, set()
+    for i in range(0, len(ids), step):
+        for parent, info in fetch_attachment_infos(session, layer_url, ids[i:i + step],
+                                                    cap, tally, token):
+            folder = os.path.join(root, str(parent))
+            os.makedirs(folder, exist_ok=True)
+            download_attachment(session, layer_url, parent, info, folder, token)
+            files += 1
+            parents.add(parent)
+    return {"files": files, "features": len(parents), "by_count": tally["by_count"],
+            "by_cap": tally["by_cap"]}
 
 
 # ----------------------------------------------------------------------- driver
@@ -696,8 +956,26 @@ def _save_progress(path, done):
     os.replace(tmp, path)
 
 
+def _report_attachments(layer, summary):
+    """Say what the attachment pass did, and how strong the evidence for it was."""
+    if summary is None:
+        arcpy.AddMessage(f"{layer['name']}: no attachments on this layer")
+        return
+    arcpy.AddMessage(
+        "%s: %d attachment(s) for %d feature(s); %d batch(es) checked against the server's "
+        "per-feature counts, %d against the server cap only"
+        % (layer["name"], summary["files"], summary["features"],
+           summary["by_count"], summary["by_cap"])
+    )
+    if summary["by_cap"]:
+        arcpy.AddWarning(
+            f"{layer['name']}: this server cannot count attachments per feature "
+            "(returnCountOnly), so completeness rests on the cap rule alone"
+        )
+
+
 def download_service(service_url, output_folder, gdb_name=None,
-                     token=None, out_sr=None, where=None, resume=False):
+                     token=None, out_sr=None, where=None, resume=False, attachments=False):
     """Download every queryable layer of a service. Returns list of (name, count)."""
     service_url = service_url.rstrip("/")
     where = where or WHERE
@@ -731,7 +1009,8 @@ def download_service(service_url, output_folder, gdb_name=None,
     for layer in layers:
         key = str(layer["id"])
         prior = done.get(key)
-        if prior and arcpy.Exists(os.path.join(gdb, prior["name"])):
+        # A layer finished without its attachments is not finished for a run that wants them.
+        if prior and (prior.get("attachments") or not attachments)                 and arcpy.Exists(os.path.join(gdb, prior["name"])):
             taken.add(prior["name"].lower())
             results.append((prior["name"], prior["count"]))
             arcpy.AddMessage(
@@ -742,9 +1021,12 @@ def download_service(service_url, output_folder, gdb_name=None,
             name, count = download_layer(session, service_url, layer, gdb, service_max,
                                          taken, token=token, out_sr=out_sr, where=where)
             results.append((name, count))
-            done[key] = {"name": name, "count": count}
-            _save_progress(progress_path, done)
             arcpy.AddMessage(f"{layer['name']}: {count} records -> {os.path.join(gdb, name)}")
+            if attachments:
+                _report_attachments(layer, pull_attachments(
+                    session, service_url, layer, name, gdb, count, token=token, where=where))
+            done[key] = {"name": name, "count": count, "attachments": bool(attachments)}
+            _save_progress(progress_path, done)
         except Exception as exc:
             failures.append((layer["name"], str(exc)))
             arcpy.AddError(f"{layer['name']}: FAILED - {exc}")
@@ -764,78 +1046,576 @@ def download_service(service_url, output_folder, gdb_name=None,
 
 
 # ------------------------------------------------------------------- self-check
+#
+# --self-check never leaves the machine. It swaps in an in-memory stand-in for arcpy and
+# starts a stub ArcGIS REST server on 127.0.0.1, so the whole pull runs on any Python that
+# has requests, with or without ArcGIS Pro. The stub can be told to misbehave in exactly the
+# ways this tool exists to catch. The real arcpy calls are never exercised by it.
 
 
-def _offline_checks():
-    """Assertions that need no server, run first so a network fault cannot mask a bug.
+class _Harness(object):
+    """check() and raises(), with the count the footer reports."""
+
+    def __init__(self, quiet=False):
+        self.passed = 0
+        self.failed = []
+        self.quiet = quiet
+
+    def check(self, cond, label):
+        if cond:
+            self.passed += 1
+        else:
+            self.failed.append(label)
+        if not self.quiet:
+            print("%s  %s" % ("PASS" if cond else "FAIL", label))
+
+    def raises(self, fn, label, exc=RuntimeError, text=None):
+        try:
+            fn()
+        except exc as err:
+            self.check(text is None or text in str(err), label)
+            return str(err)
+        except Exception as err:
+            self.check(False, "%s (wrong exception %r)" % (label, err))
+        else:
+            self.check(False, "%s (no error raised)" % label)
+        return ""
+
+    def footer(self):
+        print("-" * 68)
+        print("%d assertions, %d failed" % (self.passed + len(self.failed), len(self.failed)))
+        return 1 if self.failed else 0
+
+
+@contextlib.contextmanager
+def _swapped(name, value):
+    """Set a module global for the duration of a block."""
+    old = globals()[name]
+    globals()[name] = value
+    try:
+        yield
+    finally:
+        globals()[name] = old
+
+
+class _FakeArcpy(object):
+    """In-memory stand-in for the arcpy calls this tool makes. Feature classes are lists."""
+
+    def __init__(self):
+        self.classes = {}
+        self.messages, self.warnings, self.errors = [], [], []
+        self.drop_rows = 0
+        self.stale = None
+        self.skip_deletes = 0
+        self.on_message = None
+        self._serial = 0
+        self.management = types.SimpleNamespace(
+            CreateFileGDB=self._create_gdb, Delete=self._delete, Rename=self._rename,
+            Append=self._append, GetCount=self._count)
+        self.conversion = types.SimpleNamespace(JSONToFeatures=self._from_json)
+
+    def Exists(self, path):
+        return path in self.classes or os.path.isdir(path)
+
+    def AddMessage(self, text):
+        self.messages.append(text)
+        if self.on_message:
+            self.on_message(text)
+
+    def AddWarning(self, text):
+        self.warnings.append(text)
+
+    def AddError(self, text):
+        self.errors.append(text)
+
+    def ValidateTableName(self, name, workspace):
+        clean = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        return "T" + clean if clean[:1].isdigit() else clean
+
+    def CreateUniqueName(self, base, workspace):
+        if self.stale and base.startswith("stg_"):
+            return self.stale
+        self._serial += 1
+        return os.path.join(workspace, "%s_%d" % (base, self._serial))
+
+    def _create_gdb(self, folder, name):
+        os.makedirs(os.path.join(folder, name))
+
+    def _delete(self, path):
+        if self.skip_deletes and os.path.basename(path).startswith("stg_"):
+            self.skip_deletes -= 1
+            return
+        self.classes.pop(path, None)
+
+    def _rename(self, old, new):
+        self.classes[new] = self.classes.pop(old)
+
+    def _append(self, source, target, test):
+        self.classes[target].extend(self.classes[source])
+
+    def _count(self, path):
+        return [str(len(self.classes[path]))]
+
+    def _from_json(self, path, target):
+        with open(path, encoding="utf-8") as fh:
+            self.classes[target] = json.load(fh)["features"][self.drop_rows:]
+
+
+class _Layer(object):
+    """One stub layer: its rows, and the faults it is told to show. See _Stub.respond."""
+
+    def __init__(self, n=0, cap=1000, geom=True, oids=None, nogeom=(), coincident=False,
+                 name="Pts", table=False, **flags):
+        self.cap, self.name, self.table, self.geom, self.f = cap, name, table, geom, flags
+        self.rows = []
+        for i, oid in enumerate(list(oids) if oids is not None else range(1, n + 1)):
+            at = coincident if isinstance(coincident, tuple) else (5.0, 5.0)
+            x, y = at if coincident else ((i % 51) * 10.0, (i // 51) * 10.0)
+            self.rows.append({"oid": oid, "x": x, "y": y, "geom": geom and oid not in nogeom})
+        self.att = {}
+
+    def select(self, p):
+        rows = self.rows
+        window = re.search(r"OBJECTID >= (\d+) AND OBJECTID <= (\d+)", p.get("where") or "")
+        if window:
+            lo, hi = int(window.group(1)), int(window.group(2))
+            rows = [r for r in rows if lo <= r["oid"] <= hi]
+        if p.get("objectIds"):
+            ids = set(int(x) for x in p["objectIds"].split(","))
+            rows = [r for r in rows if r["oid"] in ids]
+        if p.get("geometry"):
+            env = json.loads(p["geometry"])
+            rows = [r for r in rows if r["geom"] and env["xmin"] <= r["x"] <= env["xmax"]
+                    and env["ymin"] <= r["y"] <= env["ymax"]]
+        return rows
+
+    def meta(self, lid):
+        out = {"id": lid, "name": self.name, "maxRecordCount": self.cap,
+               "fields": [{"name": "OBJECTID", "type": "esriFieldTypeOID"}],
+               "advancedQueryCapabilities": {
+                   "supportsPagination": self.f.get("paging", True),
+                   "supportsQueryAttachments": self.f.get("query_att", True)},
+               "hasAttachments": bool(self.f.get("has_att", False))}
+        if not self.f.get("oid_in_fields_only"):
+            out["objectIdField"] = "OBJECTID"
+        if self.geom:
+            out["geometryType"] = "esriGeometryPoint"
+            out["extent"] = {"xmin": -10.0, "ymin": -10.0, "xmax": 520.0, "ymax": 500.0,
+                             "spatialReference": {"wkid": 102100, "latestWkid": 3857}}
+        return out
+
+    def feature(self, row):
+        feat = {"attributes": {"OBJECTID": row["oid"], "NAME": "r%d" % row["oid"]}}
+        if row["geom"]:
+            feat["geometry"] = {"x": row["x"], "y": row["y"]}
+        return feat
+
+
+_ERR = {"error": {"code": 400, "message": "stub refuses", "details": ["on purpose"]}}
+
+
+class _Stub(object):
+    """An ArcGIS REST impostor. Layers live under /svc/FeatureServer, faults in layer.f."""
+
+    def __init__(self):
+        self.layers, self.extra, self.extra_tables, self.token = {}, [], [], None
+        self.hits, self.flaky = [], set()
+
+    def respond(self, method, path, p):
+        """(status, headers, body, claimed_length). claimed_length None means len(body)."""
+        self.hits.append((method, path, p))
+        if self.token and p.get("token") != self.token and "/misc/" not in path:
+            if method == "GET":
+                return 403, {}, b"forbidden", None
+            return self.json(_ERR)
+        if path == "/misc/folder":
+            return self.json({"folders": ["F"], "services": [{"name": "A/B"}]})
+        if path == "/misc/emptyfolder":
+            return self.json({"folders": [], "services": []})
+        if path.startswith("/misc/flaky"):
+            first = path not in self.flaky
+            self.flaky.add(path)
+            if first:
+                return (429 if path.endswith("429") else 503), {}, b"busy", None
+            return self.json({"ok": True})
+        if path == "/misc/slow":
+            time.sleep(1.5)
+            return self.json({})
+        if path == "/misc/notjson":
+            return 200, {}, b"<html>sign in</html>", None
+        if path == "/misc/http500":
+            return 500, {}, b"boom", None
+        if path == "/misc/errbody":
+            return self.json(_ERR)
+        if path == "/misc/errplain":
+            return self.json({"error": {"code": 500}})
+        if path == "/misc/nolayers":
+            return self.json({"layers": [], "tables": []})
+        if path == "/svc/FeatureServer":
+            return self.json(self.service())
+        found = re.match(r"^/svc/FeatureServer/(\d+)(?:/(.*))?$", path)
+        if not found or int(found.group(1)) not in self.layers:
+            return 404, {}, b"no such layer", None
+        lid, rest = int(found.group(1)), found.group(2)
+        layer = self.layers[lid]
+        if rest is None:
+            return self.json(layer.meta(lid))
+        if rest == "query":
+            return self.json(self.query(layer, p))
+        if rest == "queryAttachments":
+            return self.json(self.query_attachments(layer, p))
+        grab = re.match(r"^(\d+)/attachments/(\d+)$", rest)
+        return self.download(layer, int(grab.group(1)), int(grab.group(2)))
+
+    @staticmethod
+    def json(obj):
+        return 200, {"Content-Type": "application/json"}, json.dumps(obj).encode("utf-8"), None
+
+    def service(self):
+        layers = [{"id": i, "name": l.name} for i, l in sorted(self.layers.items())
+                  if not l.table] + self.extra
+        tables = [{"id": i, "name": l.name} for i, l in sorted(self.layers.items())
+                  if l.table] + self.extra_tables
+        return {"maxRecordCount": 2000, "layers": layers, "tables": tables}
+
+    def query(self, layer, p):
+        f = layer.f
+        rows = layer.select(p)
+        if p.get("returnCountOnly") == "true":
+            return {} if f.get("no_count") else {"count": len(rows)}
+        if p.get("returnIdsOnly") == "true":
+            if f.get("ids_fail") == "all" or (f.get("ids_fail") and not p.get("geometry")):
+                return _ERR
+            ids = [r["oid"] for r in rows]
+            return {"objectIdFieldName": "OBJECTID",
+                    "objectIds": ids[:-1] if f.get("ids_short") else ids}
+        if p.get("outStatistics"):
+            if f.get("stats_fail"):
+                return _ERR
+            ids = [r["oid"] for r in rows]
+            return {"features": [{"attributes": {
+                "oid_min": min(ids) if ids else None, "oid_max": max(ids) if ids else None}}]}
+        if p.get("returnExtentOnly") == "true":
+            if f.get("extent_fail"):
+                return _ERR
+            if f.get("extent_nox"):
+                return {"extent": {"xmax": 1}}
+            pts = [r for r in rows if r["geom"]]
+            if not pts:
+                return {"extent": None}
+            env = {"xmin": min(r["x"] for r in pts), "xmax": max(r["x"] for r in pts),
+                   "ymin": min(r["y"] for r in pts), "ymax": max(r["y"] for r in pts)}
+            if not f.get("extent_nosr"):
+                env["spatialReference"] = {"wkid": 2237}
+            return {"extent": env}
+        start = 0 if (f.get("ignore_offset") or p.get("objectIds")) \
+            else int(p.get("resultOffset") or 0)
+        size = min(int(p.get("resultRecordCount") or layer.cap), layer.cap)
+        chosen = rows[start:start + size]
+        page = {"features": [layer.feature(r) for r in chosen if r["oid"] not in f.get("hide", ())]}
+        if len(rows) > start + len(chosen) and f.get("flag", True):
+            page["exceededTransferLimit"] = True
+        return page
+
+    def query_attachments(self, layer, p):
+        f = layer.f
+        wanted = [int(x) for x in p["objectIds"].split(",")]
+        held = [o for o in wanted if layer.att.get(o)]
+        if p.get("returnCountOnly") == "true":
+            if f.get("att_count_fail"):
+                return _ERR
+            if f.get("att_count_ignored"):
+                return {"attachmentGroups": self.groups(layer, held)}
+            return {"attachmentGroups": [{"parentObjectId": o, "count": len(layer.att[o])}
+                                         for o in held]}
+        if f.get("att_notlist"):
+            return {"attachmentGroups": None}
+        groups = self.groups(layer, held)
+        if f.get("att_drop_groups"):
+            groups = groups[:-1]
+        if f.get("att_cap"):
+            left = f["att_cap"]
+            for g in groups:
+                g["attachmentInfos"] = g["attachmentInfos"][:left]
+                left -= len(g["attachmentInfos"])
+            groups = [g for g in groups if g["attachmentInfos"]]
+        if f.get("att_foreign"):
+            groups.append({"parentObjectId": 999999, "attachmentInfos": [{"id": 1}]})
+        if f.get("att_dup") and groups:
+            groups.append(groups[0])
+        if f.get("att_noid") and groups:
+            groups[0]["attachmentInfos"][0].pop("id")
+        return {"attachmentGroups": groups}
+
+    @staticmethod
+    def groups(layer, held):
+        add = layer.f.get("att_size_add", 0)
+        return [{"parentObjectId": o, "attachmentInfos": [
+            {"id": i, "name": name, "size": len(data) + add, "contentType": "text/plain"}
+            for i, name, data in layer.att[o]]} for o in held]
+
+    def download(self, layer, parent, att_id):
+        f = layer.f
+        data = next((d for i, n, d in layer.att.get(parent, []) if i == att_id), None)
+        if data is None or f.get("att_404"):
+            return 404, {}, b"missing", None
+        if f.get("att_gzip"):
+            return 200, {"Content-Encoding": "gzip"}, gzip.compress(data), None
+        if f.get("att_short"):
+            return 200, {}, data[:len(data) // 2], len(data)
+        return 200, {}, data, -1 if f.get("att_nolen") else None
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _serve(self, params):
+        flat = {k: v[0] for k, v in params.items()}
+        status, headers, body, claimed = self.server.stub.respond(
+            self.command, urlparse(self.path).path, flat)
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        if claimed != -1:
+            self.send_header("Content-Length", str(len(body) if claimed is None else claimed))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(parse_qs(urlparse(self.path).query))
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length") or 0)
+        self._serve(parse_qs(self.rfile.read(size).decode("utf-8")))
+
+
+class _StubServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass  # a client that gave up on /misc/slow is the test, not a fault
+
+
+def _exit_code(fn):
+    """The SystemExit code fn raises with stderr muted, or None when it returns."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            fn()
+    except SystemExit as err:
+        return err.code
+    return None
+
+
+def _offline_checks(t):
+    """Assertions that need no server and no stand-in, run first so a fault cannot mask them.
 
     The two pieces of logic here are the ones a live check cannot exercise on demand:
     a server that truncates on cue is not something a public sample service provides,
     and an interrupted run is not something a check can stage against production.
     """
+    check = t.check
     parent = {"xmin": 0.0, "ymin": 0.0, "xmax": 10.0, "ymax": 20.0,
               "spatialReference": {"wkid": 2237}}
     quads = _split_envelope(parent)
-    assert len(quads) == 4, "an envelope splits into exactly four quadrants"
-    assert all(q["spatialReference"] == parent["spatialReference"] for q in quads), \
-        "quadrants must carry the parent spatial reference or the query reprojects"
+    check(len(quads) == 4, "an envelope splits into exactly four quadrants")
+    check(all(q["spatialReference"] == parent["spatialReference"] for q in quads),
+          "quadrants must carry the parent spatial reference or the query reprojects")
     area = sum((q["xmax"] - q["xmin"]) * (q["ymax"] - q["ymin"]) for q in quads)
-    assert abs(area - 200.0) < 1e-9, "quadrants must tile the parent exactly, no gaps or overlap"
-    assert {(q["xmin"], q["ymin"]) for q in quads} == {(0.0, 0.0), (5.0, 0.0),
-                                                       (0.0, 10.0), (5.0, 10.0)}, \
-        "quadrants must be the four corners, not four copies"
-    assert _split_envelope({"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1})[0].get(
-        "spatialReference") is None, "an extent with no SR must not gain an empty one"
+    check(abs(area - 200.0) < 1e-9, "quadrants must tile the parent exactly, no gaps or overlap")
+    check({(q["xmin"], q["ymin"]) for q in quads} == {(0.0, 0.0), (5.0, 0.0),
+                                                       (0.0, 10.0), (5.0, 10.0)},
+          "quadrants must be the four corners, not four copies")
+    check(_split_envelope({"xmin": 0, "ymin": 0, "xmax": 1, "ymax": 1})[0].get(
+        "spatialReference") is None, "an extent with no SR must not gain an empty one")
 
     tmp = tempfile.mkdtemp(prefix="restdl_progress_")
     try:
         path = os.path.join(tmp, "x.gdb.progress.json")
-        assert _load_progress(path) == {}, "a missing progress file reads as nothing done"
+        check(_load_progress(path) == {}, "a missing progress file reads as nothing done")
         _save_progress(path, {"0": {"name": "Roads", "count": 12}})
-        assert _load_progress(path)["0"]["count"] == 12, "progress must survive a round trip"
+        check(_load_progress(path)["0"]["count"] == 12, "progress must survive a round trip")
         _save_progress(path, {"0": {"name": "Roads", "count": 12},
                               "3": {"name": "Signs", "count": 4}})
-        assert len(_load_progress(path)) == 2, "a later save must not lose an earlier layer"
+        check(len(_load_progress(path)) == 2, "a later save must not lose an earlier layer")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write('{"0": {"name": "Ro')
-        assert _load_progress(path) == {}, "a truncated progress file must not raise"
+        check(_load_progress(path) == {}, "a truncated progress file must not raise")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("[1, 2, 3]")
-        assert _load_progress(path) == {}, "a progress file of the wrong shape must not raise"
+        check(_load_progress(path) == {}, "a progress file of the wrong shape must not raise")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    # Prefix of --self-check (the longest flag). Parser must refuse it, not expand it.
-    stderr = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(stderr):
-            _parser().parse_args(["--self"])
-        refused = False
-    except SystemExit:
-        refused = True
-    assert refused, "a unique prefix of a flag must be refused, not expanded"  # <-- pinned defect
-
-    print("offline checks OK: 11 assertions")
+    # Prefix of --self-check-live (the longest flag). Parser must refuse it, not expand it.
+    check(_exit_code(lambda: _parser().parse_args(["--self-check-l"])) == 2,
+          "a unique prefix of a flag must be refused, not expanded  <-- pinned defect")
+    check(_exit_code(lambda: _parser().parse_args(["--self-check"])) is None,
+          "the whole flag is still accepted")
 
 
-def self_check():
-    """Live check against a layer whose record count exceeds the server page size.
+def _pure_checks(t):
+    """The decision core: every verdict on a hand-made input, no server."""
+    check = t.check
+    probe = _Harness(quiet=True)
+    probe.check(False, "x")
+    probe.raises(lambda: None, "y")
+    probe.raises(lambda: 1 // 0, "z")
+    probe.raises(lambda: 1 // 0, "w", exc=ZeroDivisionError, text="division")
+    check(len(probe.failed) == 3 and probe.passed == 1,
+          "check() and raises() really do record a failure  <-- pinned defect")
 
-    That shape is the whole point: it is the case where a naive pager silently drops
-    rows, so the check proves both that this pager gets them all and that the naive
-    stride does not. Configure the target with SELF_CHECK_URL / SELF_CHECK_LAYER.
-    """
-    _offline_checks()
+    check(short_read_verdict(2500, 2500, 0) is None, "a pull of exactly the server count is whole")
+    check("downloaded 2497 of 2500 records, 3 short" == short_read_verdict(2500, 2497, 0),
+          "three rows short of the count is named with both numbers  <-- pinned defect")
+    check("counted 2500" in short_read_verdict(2500, 2503, 0),
+          "more rows than the server counted is refused too")
+    check("twice" in short_read_verdict(2000, 2000, 1000),
+          "a repeated page is refused although the count matches  <-- pinned defect")
+    check("only 1000 distinct" in short_read_verdict(2000, 2000, 1000),
+          "the refusal says how many distinct rows were really read")
 
-    url = SELF_CHECK_URL
-    session = make_session()
-    layer_url = f"{url}/{SELF_CHECK_LAYER}"
+    seen = set()
+    page = {"features": [{"attributes": {"OID": 1}}, {"attributes": {"OID": 2}}]}
+    check(note_ids(page, "OID", seen) == 0 and seen == {1, 2}, "a first page repeats nothing")
+    check(note_ids(page, "OID", seen) == 2, "the same page again repeats both rows")
+    check(note_ids({"features": [{"attributes": {}}, {}]}, "OID", seen) == 0,
+          "a feature with no OID value is not tracked and not counted")
+    check(note_ids({}, "OID", seen) == 0 and note_ids(page, None, set()) == 0,
+          "a page with no features, or a layer with no OID field, repeats nothing")
+
+    check(safe_filename("../../evil.txt") == "_.._evil.txt",
+          "an attachment named with ../ cannot leave its folder  <-- pinned defect")
+    check(safe_filename("a\\b:c.txt") == "a_b_c.txt", "a backslash or colon in a name becomes _")
+    check(safe_filename(None) == "attachment" and safe_filename("...") == "attachment",
+          "a missing or all-dot name falls back to a fixed one")
+    check(len(safe_filename("x" * 500)) == 100, "a very long name is cut to 100 characters")
+    check(safe_filename("caf\u00e9.png") == "caf_.png", "a non-ASCII name is reduced to ASCII")
+
+    check(file_problem(10, 10, 10) is None, "a body of the listed size is whole")
+    check("Content-Length said 10" in file_problem(10, 10, 5),
+          "a body shorter than its Content-Length is refused")
+    check("5 bytes of the 10" in file_problem(10, None, 5),
+          "a body shorter than the size the server lists is refused")
+    check(file_problem(1, None, 10) is None,
+          "a body longer than the listed size is accepted, since the unit is undocumented")
+    check(file_problem("n/a", None, 5) is None and file_problem(None, None, 0) is None,
+          "a size that is not a number gives nothing to compare")
+
+    two = [{"parentObjectId": 1, "attachmentInfos": [{"id": 1}, {"id": 2}]},
+           {"parentObjectId": 2, "attachmentInfos": [{"id": 3}]}]
+    check(attachment_batch_problems([1, 2, 3], two, {1: 2, 2: 1}, 100) == [],
+          "a list that matches the per-feature counts is whole")
+    short = attachment_batch_problems([1, 2], two[:1], {1: 2, 2: 1}, 100)
+    check(len(short) == 1 and "feature 2" in short[0],
+          "a feature the server counts but the list lacks is named  <-- pinned defect")
+    check("counts 2 attachment(s), the query listed 1" in attachment_batch_problems(
+        [1], [{"parentObjectId": 1, "attachmentInfos": [{"id": 1}]}], {1: 2}, 100)[0],
+        "a feature listed short of its count says both numbers")
+    check("never asked for" in attachment_batch_problems([1], two, {1: 2}, 100)[0],
+          "a group for a feature nobody asked about is refused")
+    check("twice" in attachment_batch_problems([1], two[:1] * 2, {1: 2}, 100)[0],
+          "a feature answered twice is refused")
+    check("no id" in attachment_batch_problems(
+        [1], [{"parentObjectId": 1, "attachmentInfos": [{"name": "x"}]}], {1: 1}, 100)[0],
+        "an attachment with no id is refused")
+    check("no id" in attachment_batch_problems(
+        [1], [{"parentObjectId": 1, "attachmentInfos": "x"}], {1: 1}, 100)[0]
+          and "never asked" in attachment_batch_problems([1], ["x"], {}, 100)[0],
+          "an attachment list of the wrong shape, or a group that is not an object, is refused")
+    check(attachment_batch_problems([1], None, {}, 100) == ["attachmentGroups is not a list"],
+          "an answer with no group list is refused")
+    check(attachment_batch_problems([1, 2, 3], two, {1: 2, 2: 1, 9: 1}, 100)[0].startswith(
+        "feature 9"), "a count for a feature that was not asked about is a disagreement")
+    check(attachment_batch_problems([1, 2], two, None, 100) == [],
+          "with no counts, an answer under the server cap is accepted")
+    check("cap of 3" in attachment_batch_problems([1, 2], two, None, 3)[0],
+          "with no counts, an answer that reached the server cap is refused  <-- pinned defect")
+    check("cap of 2" in attachment_batch_problems([1, 2], two, None, 2)[0],
+          "with no counts, as many groups as the cap is refused too")
+
+    check(scrub("GET /x?token=ab%2Bc failed", "ab+c") == "GET /x?token=<token> failed",
+          "a token is removed from a message in its URL-encoded form  <-- pinned defect")
+    check(scrub("sent ab+c", "ab+c") == "sent <token>" and scrub("plain", None) == "plain",
+          "the raw token is removed too, and no token leaves the message alone")
+
+    check(gdb_name_for("https://h/arcgis/rest/services/Public/Utilities/MapServer/")
+          == "Public_Utilities.gdb", "the default gdb name comes from the service path")
+    check(gdb_name_for("https://h/x") == "https___h_x.gdb" and gdb_name_for("///") == "OutputData.gdb",
+          "a URL with no services segment still yields a legal name")
+    check(page_size({"maxRecordCount": 1000}, 2000) == 1000
+          and page_size({}, 2000) == 2000 and page_size({"maxRecordCount": 250000}, None)
+          == MAX_PAGE and page_size({}, None) == 1000 and page_size({"maxRecordCount": 0}, 7) == 7,
+          "page size is the layer cap, else the service cap, capped by MAX_PAGE, else 1000")
+    check(oid_field({"objectIdField": "FID"}) == "FID" and oid_field(
+        {"fields": [{"name": "N", "type": "esriFieldTypeString"},
+                    {"name": "ID", "type": "esriFieldTypeOID"}]}) == "ID"
+          and oid_field({}) is None, "the OID field comes from objectIdField, else fields[]")
+    check(geometry_params({"hasZ": True, "hasM": True,
+                           "sourceSpatialReference": {"wkid": 2237}})
+          == {"outSR": "2237", "returnZ": "true", "returnM": "true"}
+          and geometry_params({"extent": {"spatialReference": {"latestWkid": 3857, "wkid": 1}}})
+          == {"outSR": "3857"} and geometry_params({}, "4326") == {"outSR": "4326"}
+          and geometry_params({}) == {}, "outSR, returnZ and returnM are requested only when known")
+    check(_progress_path("a.gdb") == "a.gdb.progress.json", "the progress file sits beside the gdb")
+
+
+def _http_checks(t, env):
+    """rest_get and list_layers against stub answers that look like ArcGIS Server's failures."""
+    check, raises, s = t.check, t.raises, env.session
+    misc = env.root_url + "/misc/"
+    raises(lambda: rest_get(s, misc + "notjson"), "an HTML answer is refused as non-JSON",
+           text="Non-JSON response")
+    raises(lambda: rest_get(s, misc + "errbody"),
+           "a 200 answer carrying an error body is a failure  <-- pinned defect",
+           text="ArcGIS error 400 from")
+    raises(lambda: rest_get(s, misc + "errplain"), "an error body with no details is still named",
+           text="ArcGIS error 500")
+    raises(lambda: rest_get(s, misc + "http500"), "an HTTP 500 raises", exc=requests.HTTPError)
+    raises(lambda: rest_get(s, misc + "flaky503"), "with no retries a 503 raises", exc=requests.HTTPError)
+    patient = make_session(retries=1)
+    check(rest_get(patient, misc + "flaky503") == {"ok": True}
+          and rest_get(patient, misc + "flaky429") == {"ok": True},
+          "a single 503 and a single 429 are retried and the request succeeds")
+    raises(lambda: rest_get(s, misc + "slow", timeout=0.3), "a request that outlives its timeout is abandoned",
+           exc=requests.RequestException, text="timed out")
+    raises(lambda: rest_get(s, env.base + "/9"), "an unknown layer raises", exc=requests.HTTPError)
+    raises(lambda: list_layers(s, misc + "folder"), "a folder URL is refused and says what to append",
+           text="A/B")
+    raises(lambda: list_layers(s, misc + "emptyfolder"), "an empty folder is refused too",
+           text="(none listed)")
+    check(list_layers(s, misc + "nolayers") == ([], None),
+          "a service with no layers lists nothing")
+
+    env.stub.layers = {0: _Layer(n=3, name="Roads"), 4: _Layer(n=2, geom=False, table=True,
+                                                               name="Tbl")}
+    env.stub.extra = [{"id": 2, "name": "Grp", "subLayerIds": [0]},
+                      {"id": 3, "name": "Net", "type": "Network Analysis Layer"},
+                      {"id": 5}]
+    env.stub.extra_tables = [{"id": 6}]
+    before = len(env.fake.messages)
+    items, service_max = list_layers(s, env.base)
+    check([(i["id"], i["name"]) for i in items]
+          == [(0, "Roads"), (5, "Layer_5"), (4, "Tbl"), (6, "Table_6")] and service_max == 2000,
+          "layers and tables are listed, a missing name is made up, the service cap is returned")
+    said = " ".join(env.fake.messages[before:])
+    check("Skipping group layer 2" in said and "Skipping non-queryable layer 3" in said,
+          "group and network layers are skipped and the skip is said aloud")
+    env.stub.extra, env.stub.extra_tables = [], []
+
+
+def _layer_checks(t, url, layer_id, folder):
+    """The layer checks that predate the stub. They run against a stub here and against a
+    real server with --self-check-live. The layer must hold more records than its own cap."""
+    check = t.check
+    session = make_session(retries=0)
+    layer_url = "%s/%s" % (url, layer_id)
     meta = rest_get(session, layer_url)
     size = page_size(meta, None)
-    expected = rest_get(session, f"{layer_url}/query",
+    expected = rest_get(session, layer_url + "/query",
                         {"where": "1=1", "returnCountOnly": "true"})["count"]
-    assert expected > size, f"self-check needs count>{size}, layer has {expected}"
-
+    check(expected > size, "the layer holds more records than its page size (%d > %d)"
+          % (expected, size))
     oid = oid_field(meta)
 
     def page_all(request_size):
@@ -845,38 +1625,477 @@ def self_check():
                 seen.add(f["attributes"][oid])
         return seen
 
-    assert len(page_all(size)) == expected, "paging at the advertised page size lost records"
+    check(len(page_all(size)) == expected, "paging at the advertised page size lost no records")
 
     # The regression that matters most: when the server serves fewer rows than were
     # requested, a short page must not be mistaken for the end of the layer.
-    assert len(page_all(size * 3)) == expected, "over-large page request lost records"
+    check(len(page_all(size * 3)) == expected,
+          "an over-large page request lost no records  <-- pinned defect")
 
     # The original defect: striding by more than the server will serve.
     naive = set()
     for off in range(0, expected, 5000):
-        page = rest_get(session, f"{layer_url}/query",
+        page = rest_get(session, layer_url + "/query",
                         {"where": "1=1", "outFields": "*", "returnGeometry": "false",
                          "resultOffset": off, "resultRecordCount": 5000})
         for f in page.get("features", []):
             naive.add(f["attributes"][oid])
-    assert len(naive) < expected, "expected the naive stride to lose records"
+    check(len(naive) < expected,
+          "the naive 5000 stride demonstrably loses records  <-- pinned defect")
 
-    tmp = tempfile.mkdtemp(prefix="restdl_check_")
-    try:
-        name, count = download_layer(session, url,
-                                     {"id": SELF_CHECK_LAYER, "name": "SelfCheck"},
-                                     _scratch_gdb(tmp), None, set())
-        assert count == expected, f"download_layer wrote {count}, expected {expected}"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    print(f"self-check OK: {expected} records, page size {size}, "
-          f"naive 5000-stride would have captured only {len(naive)}")
+    name, count = download_layer(session, url, {"id": layer_id, "name": "SelfCheck"},
+                                 _scratch_gdb(folder), None, set())
+    check(count == expected, "download_layer wrote the verified count (%d of %d)"
+          % (count, expected))
+    return expected, size, len(naive)
 
 
 def _scratch_gdb(folder):
     arcpy.management.CreateFileGDB(folder, "check.gdb")
     return os.path.join(folder, "check.gdb")
+
+
+def _strategy_checks(t, env):
+    """Every paging strategy, and every way a pull can come back short."""
+    check, raises, fake, stub = t.check, t.raises, env.fake, env.stub
+
+    mark = len(stub.hits)
+    (name, count), gdb = env.pull(_Layer(n=2500))
+    check(count == 2500 and name == "Pts" and not fake.warnings
+          and len(fake.classes[os.path.join(gdb, name)]) == 2500
+          and not [k for k in fake.classes if "stg_" in k],
+          "a clean paged pull lands every row, warns of nothing and leaves no staging class")
+    check(any(h[2].get("outSR") == "3857" for h in stub.hits[mark:]),
+          "the output spatial reference is pinned to the layer's own, not left to the service")
+
+    (name, count), gdb = env.pull(_Layer(n=2000, ignore_offset=True))
+    rows = fake.classes[os.path.join(gdb, name)]
+    check(count == 2000 and len({r["attributes"]["OBJECTID"] for r in rows}) == 2000,
+          "a server that ignores resultOffset still yields 2000 distinct rows by fallback")
+    check("came back twice" in fake.warnings[0] and "resultOffset paging" in fake.warnings[0],
+          "the fallback names the strategy that failed and why, because a repeated page whose "
+          "count matches is refused  <-- pinned defect")
+
+    seed = {"seed": ["old"]}
+    msg = raises(lambda: env.pull(_Layer(n=100, hide={98, 99, 100}), seed=seed),
+                 "a pull three rows short on every strategy fails the layer  <-- pinned defect",
+                 text="every strategy failed, existing output left untouched")
+    check("downloaded 97 of 100 records, 3 short" in msg and "envelope quadtree" in msg,
+          "the failure lists each strategy that came up short, the quadtree included")
+    check(fake.classes[seed["target"]] == ["old"] and not [k for k in fake.classes if "stg_" in k],
+          "the previous copy survives a short read and no staging class is left behind")
+
+    raises(lambda: env.pull(_Layer(n=100, no_count=True)),
+           "a server that returns no count is refused, not trusted  <-- pinned defect",
+           text="no record count")
+    fake.drop_rows = 1
+    raises(lambda: env.pull(_Layer(n=10)),
+           "a row the conversion drops is caught, the count is read back from the class",
+           text="downloaded 9 of 10")
+    fake.drop_rows = 0
+
+    seed = {"seed": ["old"]}
+    (name, count), gdb = env.pull(_Layer(n=0), seed=seed)
+    check(count == 0 and "left in place" in fake.warnings[-1] and fake.classes[seed["target"]]
+          == ["old"], "an emptied layer says its old copy is stale and leaves it")
+    env.pull(_Layer(n=0))
+    check("nothing written" in fake.warnings[-1], "an empty layer with no copy says nothing was written")
+
+    (name, count), gdb = env.pull(_Layer(n=300, paging=False, ids_fail="plain", oid_in_fields_only=True))
+    check(count == 300 and "objectId range succeeded after 1 failed strategy" in fake.warnings[-1],
+          "with no pagination and no ID list the range windows pull 300 rows and say so")
+
+    mark = len(stub.hits)
+    (name, count), gdb = env.pull(_Layer(n=500, cap=100, paging=False, ids_fail="plain",
+                                         stats_fail=True, flag=False))
+    check(count == 500 and "envelope quadtree succeeded after 2 failed strategies"
+          in fake.warnings[-1], "with nothing else working the quadtree pulls 500 rows")
+    first = next(json.loads(h[2]["geometry"]) for h in stub.hits[mark:] if h[2].get("geometry"))
+    check(first["xmax"] == 500.0 and first["ymax"] == 90.0 and first["xmin"] == 0.0,
+          "the quadtree starts from the extent of the rows, not the published layer extent")
+
+    (name, count), gdb = env.pull(_Layer(n=300, cap=100, coincident=True, paging=False,
+                                         ids_fail="plain", stats_fail=True, extent_fail=True))
+    check(count == 300, "300 rows on one coordinate fall back to the cell's ID list at the depth cap")
+
+    # Four chains reach the depth cap when the pile sits on the centre of the start extent,
+    # so three of the four ID lists hold only rows the first one already yielded.
+    (name, count), gdb = env.pull(_Layer(n=300, cap=100, coincident=(255.0, 245.0), paging=False,
+                                         ids_fail="plain", stats_fail=True, extent_fail=True))
+    rows = fake.classes[os.path.join(gdb, name)]
+    check(count == 300 and len({r["attributes"]["OBJECTID"] for r in rows}) == 300,
+          "a pile on a quadrant corner is reached by four cells and is de-duplicated to 300 rows")
+
+    # A delete that silently fails leaves the half-written attempt in place for the next one.
+    fake.skip_deletes = 1
+    (name, count), gdb = env.pull(_Layer(n=2000, ignore_offset=True))
+    rows = fake.classes[os.path.join(gdb, name)]
+    check(count == 2000 and len({r["attributes"]["OBJECTID"] for r in rows}) == 2000,
+          "a half-written attempt that could not be deleted is cleared before the next strategy"
+          "  <-- pinned defect")
+    fake.stale = os.path.join(env.root, "stale_staging")
+    fake.classes[fake.stale] = [{"attributes": {"OBJECTID": -1}}]
+    (name, count), gdb = env.pull(_Layer(n=20))
+    check(count == 20 and not any(r["attributes"]["OBJECTID"] < 0
+                                  for r in fake.classes[os.path.join(gdb, name)]),
+          "a staging name that already exists is cleared before use")
+    fake.stale = None
+    raises(lambda: env.pull(_Layer(n=5, hide={1, 2, 3, 4, 5})),
+           "a server that counts rows but serves none is refused on every strategy",
+           text="returned none")
+
+    # -- strategies called directly
+    layer = _Layer(n=10, nogeom={3, 4})
+    stub.layers = {0: layer}
+    meta = rest_get(env.session, env.url(0))
+    raises(lambda: list(iter_pages_by_envelope(env.session, env.url(0), 100, "OBJECTID", meta)),
+           "rows with no geometry make the quadtree refuse up front",
+           text="2 of 10 rows have no geometry")
+    raises(lambda: list(iter_pages_by_envelope(env.session, env.url(0), 100, None, meta)),
+           "the quadtree refuses a layer with no OID field", text="needs an OID field")
+    raises(lambda: list(iter_pages_by_envelope(env.session, env.url(0), 100, "OBJECTID", {})),
+           "the quadtree refuses a table", text="this is a table")
+    stub.layers = {0: _Layer(n=3, extent_fail=True)}
+    raises(lambda: list(iter_pages_by_envelope(env.session, env.url(0), 100, "OBJECTID",
+                                               {"geometryType": "x"})),
+           "the quadtree refuses a layer that publishes no extent", text="no extent")
+    stub.layers = {0: _Layer(n=3, nogeom={1, 2, 3})}
+    check(_query_extent(env.session, env.url(0), "1=1") is None,
+          "a result set with no geometry has no extent")
+    stub.layers = {0: _Layer(n=3, extent_nox=True)}
+    check(_query_extent(env.session, env.url(0), "1=1") is None,
+          "an extent with no xmin is not an extent")
+
+    stub.layers = {0: _Layer(oids=[1, 5000, 5001], cap=1000)}
+    got = [f["attributes"]["OBJECTID"] for p in iter_pages_by_oid_range(
+        env.session, env.url(0), 1000, "OBJECTID", where="OBJECTID>0") for f in p["features"]]
+    check(got == [1, 5000, 5001], "sparse OIDs cost empty windows, never rows, under a where clause")
+    raises(lambda: list(iter_pages_by_oid_range(env.session, env.url(0), 1000, None)),
+           "range paging refuses a layer with no OID field", text="needs an OID field")
+    stub.layers = {0: _Layer(n=0)}
+    raises(lambda: list(iter_pages_by_oid_range(env.session, env.url(0), 1000, "OBJECTID")),
+           "range paging refuses an answer with no OID statistics", text="no OID statistics")
+
+    stub.layers = {0: _Layer(n=60, extent_nosr=True)}
+    got = list(iter_pages_by_envelope(env.session, env.url(0), 100, "OBJECTID", {
+        "geometryType": "esriGeometryPoint"}))
+    check(len(got) == 1 and len(got[0]["features"]) == 60,
+          "the quadtree runs on an extent that carries no spatial reference")
+    stub.layers = {0: _Layer(n=500, cap=1000)}
+    check(sum(len(p["features"]) for p in iter_pages(env.session, env.url(0), 1000, None, 500)) == 500,
+          "paging works on a layer with no OID field, unordered")
+    pages = list(iter_pages(env.session, env.url(0), 1000, "OBJECTID", None))
+    check(len(pages) == 1 and len(pages[0]["features"]) == 500,
+          "with no server count a page that is not flagged as truncated ends the layer")
+    stub.layers = {0: _Layer(n=2500, cap=1000)}
+    check(len(list(iter_pages(env.session, env.url(0), 1000, "OBJECTID", None))) == 3,
+          "with no server count a flagged page is followed to the end")
+    stub.layers = {0: _Layer(n=3, hide={1, 2, 3})}
+    check(list(_pages_by_ids(env.session, env.url(0), [1, 2, 3], 2, {"outFields": "*"})) == [],
+          "an ID batch that returns nothing yields no page")
+
+    taken = set()
+    first, second = unique_name("Pts", gdb, taken), unique_name("Pts", gdb, taken)
+    check((first, second) == ("Pts", "Pts_2"), "two layers called Pts become Pts and Pts_2")
+    check(len(unique_name("x" * 70, gdb, {"x" * 70})) <= 62, "a long colliding name stays short")
+
+
+def _att_layer(n=250, every=7, per=2, **flags):
+    """A layer in which every `every`th feature carries `per` small text attachments."""
+    layer = _Layer(n=n, has_att=True, **flags)
+    serial = 0
+    for row in layer.rows:
+        if row["oid"] % every == 0:
+            for _ in range(per):
+                serial += 1
+                layer.att.setdefault(row["oid"], []).append(
+                    (serial, "f%d.txt" % serial, ("data-%d-" % serial).encode("ascii") * 5))
+    return layer
+
+
+def _files(folder):
+    return sorted(os.path.join(d, f) for d, _, fs in os.walk(folder) for f in fs)
+
+
+def _attachment_checks(t, env):
+    """Attachment batches: whole, short, overflowing, and every way a body can be cut."""
+    check, raises, stub = t.check, t.raises, env.stub
+
+    layer = _att_layer()
+    truth = sum(len(v) for v in layer.att.values())
+    summary, folder = env.att(layer)
+    check(summary == {"files": truth, "features": len(layer.att), "by_count": 3, "by_cap": 0}
+          and len(_files(folder)) == truth,
+          "a clean pull writes every attachment and checks all three batches against the counts")
+    first = sorted(layer.att)[0]
+    one = layer.att[first][0]
+    with open(os.path.join(folder, "a.gdb.attachments", "Pts", str(first),
+                           "%d_%s" % (one[0], one[1])), "rb") as fh:
+        check(fh.read() == one[2], "an attachment is written byte for byte")
+    check(not [f for f in _files(folder) if f.endswith(".part")], "no .part file is left behind")
+
+    raises(lambda: env.att(_att_layer(att_drop_groups=True)),
+           "a list that drops a feature the server counts is refused  <-- pinned defect",
+           text="cannot be shown complete")
+    summary, folder = env.att(_att_layer(n=60, every=2, per=3, att_cap=5))
+    check(summary["files"] == 90 and len(_files(folder)) == 90,
+          "a list cut off at the server's cap is split until every attachment arrives"
+          "  <-- pinned defect")
+
+    capped = _att_layer(n=250, every=2, per=3, cap=30, att_cap=30, att_count_fail=True)
+    mark = len(stub.hits)
+    summary, folder = env.att(capped)
+    check(summary["files"] == 375 and summary["by_cap"] > 0 and summary["by_count"] == 0
+          and len([h for h in stub.hits[mark:] if h[2].get("returnCountOnly") == "true"]) == 1,
+          "with no counts the cap rule splits a batch that reached the cap, and asks for "
+          "counts once, not per batch")
+    summary, folder = env.att(_att_layer(att_count_ignored=True))
+    check(summary["by_cap"] == 3 and summary["files"] == truth,
+          "a server that answers the count query with full lists is treated as unable to count")
+    summary, folder = env.att(_att_layer(n=250, every=7, per=2), token=None)
+    check(summary["by_cap"] == 0, "a fresh pull counts again")
+
+    for flag, text in (("att_foreign", "never asked for"), ("att_dup", "twice"),
+                       ("att_noid", "no id"), ("att_notlist", "not a list")):
+        raises(lambda f=flag: env.att(_att_layer(**{f: True})),
+               "a %s answer refuses the layer" % flag[4:], text=text)
+
+    raises(lambda: env.att(_att_layer(att_short=True)),
+           "a body cut short of its Content-Length is refused  <-- pinned defect",
+           text="attachment")
+    check(not [f for f in _files(env.last_folder) if f.endswith(".part")],
+          "a refused body leaves no .part file")
+    raises(lambda: env.att(_att_layer(att_size_add=10)),
+           "a body shorter than the size the server lists is refused", text="of the")
+    summary, folder = env.att(_att_layer(att_size_add=-1))
+    check(summary["files"] == truth, "a body longer than the listed size is accepted")
+    summary, folder = env.att(_att_layer(att_gzip=True))
+    check(summary["files"] == truth and open(_files(folder)[0], "rb").read()
+          .startswith(b"data-"), "a gzip body is decoded and its Content-Length not compared")
+    summary, folder = env.att(_att_layer(att_nolen=True))
+    check(summary["files"] == truth, "a body with no Content-Length is accepted on its size alone")
+
+    raises(lambda: env.att(_att_layer(ids_short=True)),
+           "a feature list one id short of the row count is refused  <-- pinned defect",
+           text="ids for 250 rows")
+    check(env.att(_Layer(n=5))[0] is None, "a layer with no attachments reports none")
+    raises(lambda: env.att(_att_layer(query_att=False)),
+           "a layer that cannot list attachments in batches is refused, not skipped",
+           text="supportsQueryAttachments")
+    check(env.att(_att_layer(every=1000))[0]["files"] == 0,
+          "a layer that has attachments in name only completes with none")
+
+    evil = _att_layer(n=10, every=5, per=1)
+    evil.att[5] = [(1, "../../evil.txt", b"x")]
+    summary, folder = env.att(evil)
+    check(os.path.exists(os.path.join(folder, "a.gdb.attachments", "Pts", "5", "1__.._evil.txt"))
+          and not os.path.exists(os.path.join(folder, "evil.txt"))
+          and sorted(os.listdir(folder)) == ["a.gdb.attachments"],
+          "an attachment named ../../evil.txt stays inside its feature's folder  <-- pinned defect")
+
+    tok = "s3+cr/et="
+    stub.token = tok
+    layer = _att_layer(att_404=True)
+    msg = raises(lambda: env.att(layer, token=tok), "a missing attachment is refused", text="attachment")
+    check(tok not in msg and quote(tok, safe="") not in msg and "<token>" in msg,
+          "the failure of a GET that carried the token does not repeat it  <-- pinned defect")
+    summary, folder = env.att(_att_layer(), token=tok)
+    check(summary["files"] == truth, "a token reaches both the POST queries and the GET downloads")
+    raises(lambda: download_attachment(env.session, env.url(0), 1, {"id": 1, "name": "a"},
+                                       folder, token="wrong"),
+           "a download with the wrong token is refused", text="403")
+    stub.token = None
+
+
+def _service_checks(t, env):
+    """download_service end to end: names, resume, attachments, a refused layer, the token."""
+    check, raises, fake, stub = t.check, t.raises, env.fake, env.stub
+    stub.layers = {0: _att_layer(n=30, every=3, per=1), 1: _Layer(n=5, geom=False, name="Pts"),
+                   4: _Layer(n=2, geom=False, table=True, name="Tbl")}
+    stub.extra = [{"id": 2, "name": "Grp", "subLayerIds": [0]}]
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    results = download_service(env.base, folder, "Stub.gdb")
+    check(results == [("Pts", 30), ("Pts_2", 5), ("Tbl", 2)] and os.path.isdir(gdb),
+          "a service pulls every layer and table under collision-free names")
+    check(not os.path.exists(gdb + ".progress.json") and not os.path.exists(gdb + ".attachments"),
+          "a clean run deletes its progress file and writes no attachments unless asked")
+
+    # Another process removes the progress file between the last layer and the cleanup.
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    fake.on_message = lambda text: text.startswith("Done.") and os.remove(gdb + ".progress.json")
+    results = download_service(env.base, folder, "Stub.gdb")
+    fake.on_message = None
+    check(len(results) == 3, "a progress file that vanished before the cleanup does not fail a clean run")
+
+    stub.layers[1].f["no_count"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb"),
+           "one refused layer fails the run, so a scheduled job cannot report success",
+           text="Failed layers: Pts")
+    check(sorted(_load_progress(gdb + ".progress.json")) == ["0", "4"]
+          and "FAILED" in fake.errors[-1],
+          "the progress file keeps the layers that finished and the error names the one that did not")
+    stub.layers[1].f.pop("no_count")
+    results = download_service(env.base, folder, "Stub.gdb", resume=True)
+    check(results[0] == ("Pts", 30) and "already complete" in " ".join(fake.messages)
+          and not os.path.exists(gdb + ".progress.json"),
+          "resume skips what finished, redoes what did not, and removes its file")
+
+    # Finished without attachments, resumed with them: the layer must not be skipped.
+    stub.layers[1].f["no_count"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb"), "the plain run fails on layer 1")
+    stub.layers[1].f.pop("no_count")
+    download_service(env.base, folder, "Stub.gdb", resume=True, attachments=True)
+    check(len(_files(os.path.join(gdb + ".attachments", "Pts"))) == 10,
+          "a resume that wants attachments does not skip a layer finished without them"
+          "  <-- pinned defect")
+    check("no attachments on this layer" in " ".join(fake.messages)
+          and "1 batch(es) checked against the server's per-feature counts, 0 against the server cap only"
+          in " ".join(fake.messages),
+          "the run says which layers had attachments and how they were checked")
+
+    stub.layers[0].f["att_count_fail"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    download_service(env.base, folder, "Stub.gdb", attachments=True)
+    check("cap rule alone" in fake.warnings[-1],
+          "a server that cannot count attachments is reported as weaker evidence")
+    stub.layers[0].f.pop("att_count_fail")
+
+    tok = "s3+cr/et="
+    stub.token = tok
+    stub.layers[0].f["att_404"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", token=tok, attachments=True),
+           "an attachment failure fails the layer and the run", text="Failed layers: Pts")
+    check("0" not in _load_progress(os.path.join(folder, "Stub.gdb.progress.json")),
+          "a layer whose attachments failed is not recorded as finished")
+    blob = "\n".join(fake.messages + fake.warnings + fake.errors)
+    for path in _files(folder):
+        with open(path, "rb") as fh:
+            blob += fh.read().decode("latin-1")
+    check(tok not in blob and quote(tok, safe="") not in blob,
+          "the token reaches no message, warning, error, progress file or output file"
+          "  <-- pinned defect")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", token="wrong"),
+           "a wrong token is refused by the server", text="stub refuses")
+    stub.token = None
+    stub.extra = []
+
+    raises(lambda: download_service(env.base, os.path.join(folder, "nope")),
+           "a missing output folder is refused", text="does not exist")
+    raises(lambda: download_service(env.root_url + "/misc/nolayers", folder),
+           "a service with no queryable layers is refused", text="No queryable layers")
+
+
+def _cli_checks(t, env):
+    """main(): argument handling, the CONFIG fallback, and the arcpy-less exit."""
+    check, raises, stub = t.check, t.raises, env.stub
+    stub.layers = {0: _Layer(n=12)}
+    folder = tempfile.mkdtemp(dir=env.root)
+    check(main([env.base, folder, "cli.gdb", "", "2237", "1=1"]) == 0 and os.path.isdir(
+        os.path.join(folder, "cli.gdb")), "main pulls a service from positional arguments")
+    check(len([h for h in stub.hits if h[2].get("outSR") == "2237"]) > 0,
+          "a positional out_sr reaches the query")
+    with _swapped("SERVICE_URL", env.base), _swapped("OUTPUT_FOLDER", folder), \
+            _swapped("GDB_NAME", "cfg.gdb"):
+        check(main([]) == 0 and os.path.isdir(os.path.join(folder, "cfg.gdb")),
+              "main falls back to the CONFIG block when given nothing")
+    check(main([env.base, folder, "att.gdb", "--attachments", "--resume"]) == 0,
+          "main accepts --attachments and --resume together")
+    check(_exit_code(lambda: _parser().parse_args(["u", "f", "--attach"])) == 2,
+          "a prefix of --attachments is refused, not expanded  <-- pinned defect")
+    with _swapped("SERVICE_URL", ""):
+        check(_exit_code(lambda: main([])) == 2,
+              "main with no service says what to set and exits 2")
+    with _swapped("arcpy", None):
+        raises(lambda: main([env.base, folder]), "main without arcpy exits with the interpreter to use",
+               exc=SystemExit, text="arcpy was not found")
+        raises(lambda: main(["--self-check-live"]), "--self-check-live without arcpy says so",
+               exc=SystemExit, text="needs the real arcpy")
+    stub.layers = {0: _Layer(n=2500, cap=1000)}
+    out = io.StringIO()
+    with _swapped("SELF_CHECK_URL", env.base), contextlib.redirect_stdout(out):
+        code = main(["--self-check-live"])
+    check(code == 0 and "0 failed" in out.getvalue() and "live: 2500 records" in out.getvalue(),
+          "--self-check-live runs the layer checks and exits 0 (here against the stub)")
+
+
+def self_check():
+    """Run every check against a stub on 127.0.0.1. Returns the process exit code."""
+    t = _Harness()
+    print("fullpull self-check: stub server on 127.0.0.1, in-memory arcpy, no real network")
+    print("-" * 68)
+    _offline_checks(t)
+    _pure_checks(t)
+
+    stub, fake = _Stub(), _FakeArcpy()
+    server = _StubServer(("127.0.0.1", 0), _StubHandler)
+    server.stub = stub
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    root = tempfile.mkdtemp(prefix="restdl_check_")
+    root_url = "http://127.0.0.1:%d" % server.server_address[1]
+    env = types.SimpleNamespace(stub=stub, fake=fake, root=root, root_url=root_url,
+                                base=root_url + "/svc/FeatureServer",
+                                session=make_session(retries=0), last_folder=None)
+    env.url = lambda lid: "%s/%d" % (env.base, lid)
+
+    def pull(layer, where="1=1", seed=None):
+        stub.layers = {0: layer}
+        del fake.warnings[:]
+        gdb = _scratch_gdb(tempfile.mkdtemp(dir=root))
+        if seed is not None:
+            seed["target"] = os.path.join(gdb, "Pts")
+            fake.classes[seed["target"]] = seed["seed"]
+        return download_layer(env.session, env.base, {"id": 0, "name": layer.name}, gdb,
+                              None, set(), where=where), gdb
+
+    def attach(layer, token=None):
+        stub.layers = {0: layer}
+        env.last_folder = tempfile.mkdtemp(dir=root)
+        gdb = os.path.join(env.last_folder, "a.gdb")
+        summary = pull_attachments(env.session, env.base, {"id": 0, "name": "Pts"}, "Pts", gdb,
+                                   len(layer.rows), token=token)
+        return summary, env.last_folder
+
+    env.pull, env.att = pull, attach
+    saved_env = dict(os.environ)
+    os.environ["NO_PROXY"] = "127.0.0.1"
+    try:
+        with _swapped("arcpy", fake), _swapped("RETRIES", 0):
+            _http_checks(t, env)
+            stub.layers = {0: _Layer(n=2500, cap=1000)}
+            _layer_checks(t, env.base, 0, tempfile.mkdtemp(dir=root))
+            _strategy_checks(t, env)
+            _attachment_checks(t, env)
+            _service_checks(t, env)
+            _cli_checks(t, env)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+        server.shutdown()
+        server.server_close()
+        shutil.rmtree(root, ignore_errors=True)
+    return t.footer()
+
+
+def self_check_live():
+    """The layer checks against SELF_CHECK_URL, a real server, with the real arcpy."""
+    if arcpy is None:
+        sys.exit("--self-check-live needs the real arcpy. Run it with ArcGIS Pro's Python.")
+    t = _Harness()
+    folder = tempfile.mkdtemp(prefix="restdl_check_")
+    try:
+        expected, size, naive = _layer_checks(t, SELF_CHECK_URL, SELF_CHECK_LAYER, folder)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    print("live: %d records, page size %d, a naive 5000 stride would have captured only %d"
+          % (expected, size, naive))
+    return t.footer()
 
 
 # ------------------------------------------------------------------------- main
@@ -891,9 +2110,14 @@ def _parser():
     ap.add_argument("token", nargs="?", default="", help="Token for a secured service")
     ap.add_argument("out_sr", nargs="?", default="", help="Output WKID, e.g. 2237")
     ap.add_argument("where", nargs="?", default="", help="Server-side filter")
-    ap.add_argument("--self-check", action="store_true", help="Run the live self-check and exit")
+    ap.add_argument("--self-check", action="store_true",
+                    help="Run the offline self-check against a local stub and exit")
+    ap.add_argument("--self-check-live", action="store_true",
+                    help="Run the layer checks against SELF_CHECK_URL and exit")
     ap.add_argument("--resume", action="store_true",
                     help="Skip layers an earlier interrupted run already finished")
+    ap.add_argument("--attachments", action="store_true",
+                    help="Also download attachments, refusing any batch that came back short")
     return ap
 
 
@@ -905,8 +2129,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.self_check:
-        self_check()
-        return 0
+        return self_check()
+    if args.self_check_live:
+        return self_check_live()
 
     # Anything not supplied on the command line falls back to the CONFIG block, so the
     # script runs bare for the common case and stays scriptable for the rest.
@@ -914,6 +2139,15 @@ def main(argv=None):
     output_folder = args.output_folder or OUTPUT_FOLDER
     if not service_url or not output_folder:
         ap.error("set SERVICE_URL and OUTPUT_FOLDER in CONFIG, or pass them as arguments")
+    if arcpy is None:
+        # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install.
+        # Without this, a first run on the wrong interpreter is an opaque import error.
+        sys.exit(
+            "arcpy was not found. Run this with the Python that ships with ArcGIS Pro:\n"
+            r'  "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" '
+            "fullpull.py\n"
+            r"or the propy.bat in ...\Pro\bin\Python\Scripts\."
+        )
 
     download_service(
         service_url,
@@ -923,6 +2157,7 @@ def main(argv=None):
         out_sr=args.out_sr or OUT_SR or None,
         where=args.where or WHERE,
         resume=args.resume,
+        attachments=args.attachments,
     )
     return 0
 

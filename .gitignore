@@ -5,3 +5,4 @@ __pycache__/
 downloads/
 resp*.json
 download rest service.txt
+.coverage
