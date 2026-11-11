@@ -12,9 +12,10 @@ batching, objectId range windows, and a recursive envelope quadtree. A strategy 
 raises, or that finishes with the wrong record count, hands the layer to the next one.
 Only an exhausted list fails the layer. --resume skips layers an interrupted run finished.
 
-Why not just hand the REST URL to arcpy.conversion.ExportFeatures, which also works and
-also pages correctly? Measured on Public/PublicWorks/0 (3,317 records): ExportFeatures
-took 254s, this script took 1.4s. Roughly 180x, so the manual paging earns its keep.
+arcpy.conversion.ExportFeatures is the built-in alternative for one small layer. In the
+original build, on one layer of a few thousand records, it took 254s against 1.4s for this
+script (request delay off; not rerun since). The checks, not the speed, are the reason this
+script exists.
 
 A short read is refused, never accepted. The rows written are compared with the server's
 own count, rows that came back twice are refused even when the count matches by accident,
@@ -25,10 +26,14 @@ attachment list came back short of the server's own per-feature count.
 Edit the CONFIG block below and run with no arguments, or pass everything on the command
 line. Command-line arguments win over CONFIG when both are set.
 
+A token is read from the FULLPULL_TOKEN environment variable, or from standard input when
+the token argument is "-". A token typed as an argument shows in the process list.
+
     python fullpull.py                          # uses CONFIG below
     python fullpull.py <service_url> <output_folder>
     python fullpull.py <service_url> <output_folder> --resume
     python fullpull.py <service_url> <output_folder> --attachments
+    python fullpull.py <service_url> <output_folder> --delay 1
     python fullpull.py --self-check
     python fullpull.py --self-check-live        # the same layer checks against SELF_CHECK_URL
 """
@@ -37,6 +42,7 @@ import argparse
 import contextlib
 import gzip
 import http.server
+import importlib.util
 import io
 import json
 import os
@@ -50,13 +56,18 @@ import time
 import types
 from urllib.parse import parse_qs, quote, urlparse
 
+# Why a real pull cannot run here: None means arcpy imported, otherwise the licence error text.
+ARCPY_LICENCE_ERROR = None
 try:
     import arcpy
-except (ImportError, RuntimeError):
-    # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install, and it
-    # raises RuntimeError when Pro is installed but its licence is not initialised. The
+except ImportError:
+    # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install. The
     # import must not kill --self-check, which runs on a stand-in. A real pull exits in main().
     arcpy = None
+except RuntimeError as exc:
+    # arcpy raises RuntimeError when Pro is installed but its licence is not initialised.
+    arcpy = None
+    ARCPY_LICENCE_ERROR = str(exc)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -78,7 +89,8 @@ OUTPUT_FOLDER = "downloads"
 # into one folder cannot have the second overwrite the first.
 GDB_NAME = ""
 
-# Token for a secured service. Leave "" for public services.
+# Token for a secured service. Leave "" for public services. Prefer the FULLPULL_TOKEN
+# environment variable, so the token is not written into a file that may be committed.
 TOKEN = ""
 
 # Output spatial reference as a WKID, e.g. "2237". Leave "" to keep the layer's own SR.
@@ -91,7 +103,7 @@ WHERE = "1=1"
 
 # Ceiling on a single page, regardless of what the service advertises. A service's
 # maxRecordCount is not a promise it can honour: one layer tested here advertises
-# 250000 and returns HTTP 500 above ~25000. At 5000 features a page is ~9 MB and runs
+# 250000 and returned HTTP 500 above ~25000 in the original build. At 5000 features a page is ~9 MB and runs
 # ~3.6k records/sec, most of the available throughput at a fraction of the memory.
 # Raising this trades memory and 500-risk for a little speed.
 MAX_PAGE = 5_000
@@ -100,6 +112,12 @@ MAX_PAGE = 5_000
 # with exponential backoff on 429/500/502/503/504.
 TIMEOUT = 180
 RETRIES = 4
+
+# Seconds to wait between the start of one request and the start of the next. On by
+# default, because many public servers sit behind a web application firewall that bans
+# clients for their request rate. It adds half a second per request, and one page holds
+# up to MAX_PAGE rows. Set 0 (or pass --delay 0) for your own server, where speed matters.
+DELAY = 0.5
 
 # How many times the envelope strategy may subdivide before it stops splitting a cell
 # and fetches that cell by its ID list instead. Only cells that come back full are split,
@@ -116,6 +134,11 @@ MAX_ENVELOPE_DEPTH = 12
 # the server truncates at. Smaller batches cost more requests and verify just as strictly.
 ATTACH_BATCH = 100
 
+# With --attachments, a server that cannot count attachments per feature (returnCountOnly)
+# gives no way to see a list cut short below the server's cap. The pull is refused by
+# default. True (or --allow-uncounted-attachments) accepts the cap rule alone and warns.
+ALLOW_UNCOUNTED_ATTACHMENTS = False
+
 # Layer --self-check-live exercises. --self-check itself never leaves the machine: it runs
 # the same layer checks against a stub server it starts on 127.0.0.1. This one defaults to
 # Esri's public sample server, which exists for this purpose. Point it at your own server
@@ -123,7 +146,7 @@ ATTACH_BATCH = 100
 # or the check proves nothing:
 # the layer's record count must exceed its maxRecordCount, and that maxRecordCount must
 # be below 5000 (otherwise the naive-stride assertion cannot demonstrate the bug).
-# SF311 layer 0: 9,687 records, maxRecordCount 1000.
+# SF311 layer 0: 9,705 records on 2026-11-11, maxRecordCount 1000.
 SELF_CHECK_URL = "https://sampleserver6.arcgisonline.com/arcgis/rest/services/SF311/FeatureServer"
 SELF_CHECK_LAYER = 0
 
@@ -135,9 +158,12 @@ SELF_CHECK_LAYER = 0
 # --------------------------------------------------------------------------- http
 
 
-def make_session(retries=None):
+def make_session(retries=None, delay=None):
     """Session with backoff on the transient statuses ArcGIS Server actually emits."""
     s = requests.Session()
+    # Read by rest_get, which paces every request this session makes.
+    s.fullpull_delay = DELAY if delay is None else delay
+    s.fullpull_last = None
     retry = Retry(
         total=RETRIES if retries is None else retries,
         backoff_factor=1.0,
@@ -150,6 +176,16 @@ def make_session(retries=None):
     return s
 
 
+def _pace(session):
+    """Wait until the session's delay has passed since its previous request started."""
+    delay = getattr(session, "fullpull_delay", 0) or 0
+    if delay > 0 and session.fullpull_last is not None:
+        wait = session.fullpull_last + delay - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+    session.fullpull_last = time.monotonic()
+
+
 def rest_get(session, url, params=None, token=None, timeout=None):
     """Fetch an ArcGIS REST resource as JSON.
 
@@ -160,6 +196,7 @@ def rest_get(session, url, params=None, token=None, timeout=None):
     p.setdefault("f", "json")
     if token:
         p["token"] = token
+    _pace(session)
     # Long where clauses / objectIds lists blow past URL length limits; POST is
     # accepted by every ArcGIS Server for /query and is safe for metadata too.
     resp = session.post(url, data=p, timeout=TIMEOUT if timeout is None else timeout)
@@ -178,6 +215,15 @@ def rest_get(session, url, params=None, token=None, timeout=None):
 
 
 # ---------------------------------------------------------------- service metadata
+
+
+def _layer_id(entry):
+    """The layer id as an int. It goes into a URL, so a server cannot steer it elsewhere."""
+    value = entry.get("id")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError("the service lists a layer with id %r, which is not an integer, so "
+                           "it cannot be queried safely" % (value,))
+    return value
 
 
 def list_layers(session, service_url, token=None):
@@ -210,9 +256,11 @@ def list_layers(session, service_url, token=None):
                 f"{entry.get('name')} ({entry.get('type')})"
             )
             continue
-        items.append({"id": entry["id"], "name": entry.get("name") or f"Layer_{entry['id']}"})
+        items.append({"id": _layer_id(entry),
+                      "name": entry.get("name") or f"Layer_{entry['id']}"})
     for entry in info.get("tables") or []:
-        items.append({"id": entry["id"], "name": entry.get("name") or f"Table_{entry['id']}"})
+        items.append({"id": _layer_id(entry),
+                      "name": entry.get("name") or f"Table_{entry['id']}"})
     return items, info.get("maxRecordCount")
 
 
@@ -255,9 +303,8 @@ def geometry_params(layer_meta, out_sr=None):
     params = {}
     wkid = out_sr
     if not wkid:
-        src = layer_meta.get("sourceSpatialReference") or layer_meta.get("extent", {}).get(
-            "spatialReference", {}
-        )
+        src = layer_meta.get("sourceSpatialReference") or (
+            layer_meta.get("extent") or {}).get("spatialReference") or {}
         wkid = src.get("latestWkid") or src.get("wkid")
     if wkid:
         params["outSR"] = str(wkid)
@@ -405,7 +452,8 @@ def _query_extent(session, layer_url, where, token=None):
             session, f"{layer_url}/query",
             {"where": where, "returnExtentOnly": "true"}, token=token,
         ).get("extent")
-    except Exception:
+    except Exception as exc:
+        arcpy.AddMessage("returnExtentOnly failed (%s); using the published layer extent" % exc)
         return None
     if not env or env.get("xmin") is None or env.get("xmax") is None:
         return None
@@ -595,8 +643,10 @@ def attachment_batch_problems(batch, groups, counts, cap):
         elif parent in seen:
             problems.append("feature %s came back twice" % parent)
         elif not isinstance(infos, list) or any(
-                not isinstance(i, dict) or i.get("id") is None for i in infos):
-            problems.append("feature %s has an attachment with no id" % parent)
+                not isinstance(i, dict) or isinstance(i.get("id"), bool)
+                or not isinstance(i.get("id"), int) for i in infos):
+            # The id becomes part of a file name and a URL, so only an integer is trusted.
+            problems.append("feature %s has an attachment with no id or a non-integer id" % parent)
         else:
             seen[parent] = infos
     if counts is None:
@@ -696,13 +746,15 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
     if expected == 0:
         # Say plainly what was left behind. A layer that empties server-side would
         # otherwise keep serving an old copy indefinitely on a clean exit code.
-        if arcpy.Exists(target):
-            arcpy.AddWarning(
-                f"{layer['name']}: 0 records on server; existing {name} left in place "
-                "and is now stale. Delete it if the layer is meant to be empty."
+        # A server that wrongly answers 0 cannot be told from a layer that was emptied, so
+        # a copy that still holds rows is refused rather than kept as stale data on exit 0.
+        if arcpy.Exists(target) and int(arcpy.management.GetCount(target)[0]) > 0:
+            raise RuntimeError(
+                "%s: the server counts 0 records but the existing copy %s holds rows, so it "
+                "would be left stale. If the layer really is empty now, delete %s from the "
+                "geodatabase and run again" % (layer["name"], name, name)
             )
-        else:
-            arcpy.AddWarning(f"{layer['name']}: 0 records on server, nothing written.")
+        arcpy.AddWarning(f"{layer['name']}: 0 records on server, nothing written.")
         return name, 0
 
     # Download into a staging class and only replace the existing output once the new
@@ -803,10 +855,11 @@ def fetch_attachment_infos(session, layer_url, batch, cap, tally, token=None):
     """[(feature, info)] for every attachment of the features in `batch`, or raises.
 
     Asks queryAttachments for the batch, then asks the same question with returnCountOnly,
-    which Esri documents from 10.9.1 for hosted services. A batch whose list disagrees with
-    the server's own per-feature counts is split in two and asked again, because a smaller
-    batch cannot overflow a cap the larger one hit. A single feature that still disagrees
-    raises: its attachments cannot be shown to be complete.
+    which Esri documents for hosted services. A batch whose list disagrees with the server's
+    own per-feature counts is split in two and asked again, because a smaller batch cannot
+    overflow a cap the larger one hit. A single feature that still disagrees raises: its
+    attachments cannot be shown to be complete. A server that cannot count is refused, unless
+    tally["allow_uncounted"] says to accept the cap rule alone.
     """
     url = f"{layer_url}/queryAttachments"
     ids = ",".join(str(x) for x in batch)
@@ -817,12 +870,23 @@ def fetch_attachment_infos(session, layer_url, batch, cap, tally, token=None):
             counted = rest_get(session, url, {"objectIds": ids, "returnCountOnly": "true"},
                                token=token).get("attachmentGroups")
             counts = {g["parentObjectId"]: int(g["count"]) for g in counted}
-        except Exception:
-            # An older or non-hosted service errors on this form, or ignores it and answers
-            # with full lists that carry no count. Remember that, so the rest of the layer
-            # does not repeat a request that cannot succeed, and fall back to the cap rule,
-            # which the summary then reports as the weaker evidence.
+        except requests.RequestException as exc:
+            # A 5xx, a 429 or a dead connection says nothing about support, so it must not
+            # downgrade the layer to the weaker rule. A 4xx answer means "not supported".
+            status = getattr(exc.response, "status_code", None)
+            if status is None or status == 429 or status >= 500:
+                raise
             tally["counts_unsupported"] = True
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            # An older or non-hosted service answers with an ArcGIS error, or ignores the form
+            # and returns full lists that carry no count. Remember that, so the rest of the
+            # layer does not repeat a request that cannot succeed.
+            tally["counts_unsupported"] = True
+    if counts is None and not tally["allow_uncounted"]:
+        raise RuntimeError(
+            "the server cannot count attachments per feature (returnCountOnly), so a list "
+            "cut short below its record cap could not be seen; refusing. Pass "
+            "--allow-uncounted-attachments to accept the cap rule alone")
     problems = attachment_batch_problems(batch, groups, counts, cap)
     if not problems:
         tally["by_count" if counts is not None else "by_cap"] += 1
@@ -870,7 +934,8 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
     return got
 
 
-def pull_attachments(session, service_url, layer, name, gdb, expected, token=None, where="1=1"):
+def pull_attachments(session, service_url, layer, name, gdb, expected, token=None, where="1=1",
+                     allow_uncounted=False):
     """Download the attachments of a layer. Returns a summary dict, or None for a layer with none.
 
     The feature list comes from the server, and it must be exactly as long as the verified
@@ -887,10 +952,14 @@ def pull_attachments(session, service_url, layer, name, gdb, expected, token=Non
             "supportsQueryAttachments, so they cannot be listed in batches; refusing rather "
             "than skipping them"
         )
-    ids = sorted(rest_get(
+    ids = rest_get(
         session, f"{layer_url}/query",
         {"where": where, "returnIdsOnly": "true"}, token=token,
-    ).get("objectIds") or [])
+    ).get("objectIds") or []
+    if any(isinstance(i, bool) or not isinstance(i, int) for i in ids):
+        raise RuntimeError("%s: the feature list holds an id that is not an integer, so it "
+                           "cannot be used in a request or a folder name" % layer["name"])
+    ids = sorted(ids)
     if len(ids) != expected:
         raise RuntimeError(
             f"{layer['name']}: the feature list holds {len(ids)} ids for {expected} rows, so "
@@ -898,7 +967,11 @@ def pull_attachments(session, service_url, layer, name, gdb, expected, token=Non
         )
     cap = page_size(meta, None)
     step = max(1, min(ATTACH_BATCH, cap - 1))
-    tally = {"counts_unsupported": False, "by_count": 0, "by_cap": 0}
+    # Esri documents the count form for hosted services, gated by this layer property. A
+    # layer that says False is not asked, and one that does not say is tried.
+    tally = {"counts_unsupported": (meta.get("advancedQueryCapabilities") or {}).get(
+                 "supportsQueryAttachmentsCountOnly") is False,
+             "allow_uncounted": allow_uncounted, "by_count": 0, "by_cap": 0}
     root = os.path.join(gdb + ".attachments", name)
     files, parents = 0, set()
     for i in range(0, len(ids), step):
@@ -945,7 +1018,12 @@ def _load_progress(path):
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # An entry the resume cannot use is dropped, so its layer is simply downloaded again.
+    return {key: entry for key, entry in data.items()
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            and isinstance(entry.get("count"), int)}
 
 
 def _save_progress(path, done):
@@ -975,7 +1053,8 @@ def _report_attachments(layer, summary):
 
 
 def download_service(service_url, output_folder, gdb_name=None,
-                     token=None, out_sr=None, where=None, resume=False, attachments=False):
+                     token=None, out_sr=None, where=None, resume=False, attachments=False,
+                     delay=None, allow_uncounted=False):
     """Download every queryable layer of a service. Returns list of (name, count)."""
     service_url = service_url.rstrip("/")
     where = where or WHERE
@@ -985,7 +1064,7 @@ def download_service(service_url, output_folder, gdb_name=None,
 
     # Validate the URL before creating anything on disk, so a typo or a folder URL does
     # not leave an empty geodatabase behind.
-    session = make_session()
+    session = make_session(delay=delay)
     layers, service_max = list_layers(session, service_url, token=token)
     if not layers:
         raise RuntimeError(f"No queryable layers or tables found at {service_url}")
@@ -1010,7 +1089,8 @@ def download_service(service_url, output_folder, gdb_name=None,
         key = str(layer["id"])
         prior = done.get(key)
         # A layer finished without its attachments is not finished for a run that wants them.
-        if prior and (prior.get("attachments") or not attachments)                 and arcpy.Exists(os.path.join(gdb, prior["name"])):
+        if prior and (prior.get("attachments") or not attachments) \
+                and arcpy.Exists(os.path.join(gdb, prior["name"])):
             taken.add(prior["name"].lower())
             results.append((prior["name"], prior["count"]))
             arcpy.AddMessage(
@@ -1024,7 +1104,8 @@ def download_service(service_url, output_folder, gdb_name=None,
             arcpy.AddMessage(f"{layer['name']}: {count} records -> {os.path.join(gdb, name)}")
             if attachments:
                 _report_attachments(layer, pull_attachments(
-                    session, service_url, layer, name, gdb, count, token=token, where=where))
+                    session, service_url, layer, name, gdb, count, token=token, where=where,
+                    allow_uncounted=allow_uncounted))
             done[key] = {"name": name, "count": count, "attachments": bool(attachments)}
             _save_progress(progress_path, done)
         except Exception as exc:
@@ -1196,6 +1277,9 @@ class _Layer(object):
                    "supportsPagination": self.f.get("paging", True),
                    "supportsQueryAttachments": self.f.get("query_att", True)},
                "hasAttachments": bool(self.f.get("has_att", False))}
+        if "att_count_cap" in self.f:
+            out["advancedQueryCapabilities"]["supportsQueryAttachmentsCountOnly"] = \
+                self.f["att_count_cap"]
         if not self.f.get("oid_in_fields_only"):
             out["objectIdField"] = "OBJECTID"
         if self.geom:
@@ -1263,6 +1347,8 @@ class _Stub(object):
         if rest == "query":
             return self.json(self.query(layer, p))
         if rest == "queryAttachments":
+            if p.get("returnCountOnly") == "true" and layer.f.get("att_count_http"):
+                return layer.f["att_count_http"], {}, b"no", None
             return self.json(self.query_attachments(layer, p))
         grab = re.match(r"^(\d+)/attachments/(\d+)$", rest)
         return self.download(layer, int(grab.group(1)), int(grab.group(2)))
@@ -1286,7 +1372,7 @@ class _Stub(object):
         if p.get("returnIdsOnly") == "true":
             if f.get("ids_fail") == "all" or (f.get("ids_fail") and not p.get("geometry")):
                 return _ERR
-            ids = [r["oid"] for r in rows]
+            ids = [str(r["oid"]) if f.get("ids_str") else r["oid"] for r in rows]
             return {"objectIdFieldName": "OBJECTID",
                     "objectIds": ids[:-1] if f.get("ids_short") else ids}
         if p.get("outStatistics"):
@@ -1444,6 +1530,11 @@ def _offline_checks(t):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("[1, 2, 3]")
         check(_load_progress(path) == {}, "a progress file of the wrong shape must not raise")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"0": "done", "1": {"name": "Roads"}, "2": {"name": "Ok", "count": 3}}')
+        check(_load_progress(path) == {"2": {"name": "Ok", "count": 3}},
+              "a hand-edited entry the resume cannot use is dropped, not allowed to abort the "
+              "pull  <-- pinned defect")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1452,6 +1543,73 @@ def _offline_checks(t):
           "a unique prefix of a flag must be refused, not expanded  <-- pinned defect")
     check(_exit_code(lambda: _parser().parse_args(["--self-check"])) is None,
           "the whole flag is still accepted")
+
+    # --delay paces requests, and a negative delay is refused rather than ignored.
+    class _Resp(object):
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {}
+
+    class _Session(object):
+        fullpull_delay, fullpull_last = 0.2, None
+
+        def __init__(self, delay):
+            self.fullpull_delay, self.starts = delay, []
+
+        def post(self, url, data=None, timeout=None):
+            self.starts.append(time.monotonic())
+            return _Resp()
+
+    paced = _Session(0.2)
+    for _ in range(3):
+        rest_get(paced, "https://example.org/arcgis/rest/services")
+    gaps = [b - a for a, b in zip(paced.starts, paced.starts[1:])]
+    check(all(g >= 0.15 for g in gaps), "requests must be at least DELAY apart, got %s" % gaps)
+    unpaced = _Session(0)
+    began = time.monotonic()
+    for _ in range(3):
+        rest_get(unpaced, "https://example.org/arcgis/rest/services")
+    check(time.monotonic() - began < 0.1, "a delay of 0 must not sleep")
+    check(_exit_code(lambda: _parser().parse_args(["--delay", "-1"])) == 2,
+          "a negative --delay must be refused")
+    check(_parser().parse_args(["--delay", "0.5"]).delay == 0.5, "--delay must parse seconds")
+    late = _Session(0.02)
+    rest_get(late, "https://example.org/arcgis/rest/services")
+    time.sleep(0.06)
+    rest_get(late, "https://example.org/arcgis/rest/services")
+    check(late.starts[1] - late.starts[0] < 0.4,
+          "a request made after the delay has already passed does not wait again")
+
+    # Run this file under another name, with arcpy made to fail in each way it can.
+    class _BlockArcpy(object):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def find_spec(self, name, path=None, target=None):
+            # Only arcpy is ever asked for: every other import of this file is already loaded.
+            raise self.exc
+
+    def import_copy(exc):
+        held = sys.modules.pop("arcpy", None)
+        blocker = _BlockArcpy(exc)
+        sys.meta_path.insert(0, blocker)
+        try:
+            spec = importlib.util.spec_from_file_location("fullpull_copy", os.path.abspath(__file__))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            sys.meta_path.remove(blocker)
+            sys.modules.update({"arcpy": held} if held else {})
+        return module
+
+    missing = import_copy(ImportError("no arcpy"))
+    check(missing.arcpy is None and missing.ARCPY_LICENCE_ERROR is None,
+          "a missing arcpy is told apart from an arcpy that cannot get its licence")
+    unlicensed = import_copy(RuntimeError("licence not initialised"))
+    check(unlicensed.arcpy is None and unlicensed.ARCPY_LICENCE_ERROR == "licence not initialised",
+          "an arcpy that raises RuntimeError on import keeps the reason  <-- pinned defect")
 
 
 def _pure_checks(t):
@@ -1519,6 +1677,11 @@ def _pure_checks(t):
     check("no id" in attachment_batch_problems(
         [1], [{"parentObjectId": 1, "attachmentInfos": [{"name": "x"}]}], {1: 1}, 100)[0],
         "an attachment with no id is refused")
+    for bad in ("../../x", "7", True, 1.5):
+        check("non-integer id" in attachment_batch_problems(
+            [1], [{"parentObjectId": 1, "attachmentInfos": [{"id": bad}]}], {1: 1}, 100)[0],
+            "an attachment id of %r is refused, so no id can steer a file or a URL  "
+            "<-- pinned defect" % (bad,))
     check("no id" in attachment_batch_problems(
         [1], [{"parentObjectId": 1, "attachmentInfos": "x"}], {1: 1}, 100)[0]
           and "never asked" in attachment_batch_problems([1], ["x"], {}, 100)[0],
@@ -1557,6 +1720,9 @@ def _pure_checks(t):
           and geometry_params({"extent": {"spatialReference": {"latestWkid": 3857, "wkid": 1}}})
           == {"outSR": "3857"} and geometry_params({}, "4326") == {"outSR": "4326"}
           and geometry_params({}) == {}, "outSR, returnZ and returnM are requested only when known")
+    check(geometry_params({"extent": None}) == {} and geometry_params(
+        {"extent": {"spatialReference": None}}) == {},
+        "a layer whose extent or its spatial reference is null does not crash  <-- pinned defect")
     check(_progress_path("a.gdb") == "a.gdb.progress.json", "the progress file sits beside the gdb")
 
 
@@ -1602,6 +1768,15 @@ def _http_checks(t, env):
     check("Skipping group layer 2" in said and "Skipping non-queryable layer 3" in said,
           "group and network layers are skipped and the skip is said aloud")
     env.stub.extra, env.stub.extra_tables = [], []
+    for bad in ("../x", True):
+        env.stub.extra = [{"id": bad, "name": "Bad"}]
+        raises(lambda: list_layers(s, env.base), "a layer id of %r is refused  <-- pinned defect"
+               % (bad,), text="not an integer")
+    env.stub.extra = []
+    env.stub.extra_tables = [{"id": "1/../../x"}]
+    raises(lambda: list_layers(s, env.base), "a table id that is not an integer is refused",
+           text="not an integer")
+    env.stub.extra_tables = []
 
 
 def _layer_checks(t, url, layer_id, folder):
@@ -1695,9 +1870,15 @@ def _strategy_checks(t, env):
     fake.drop_rows = 0
 
     seed = {"seed": ["old"]}
+    msg = raises(lambda: env.pull(_Layer(n=0), seed=seed),
+                 "a server that counts 0 while the old copy holds rows is refused, not kept "
+                 "stale on exit 0  <-- pinned defect", text="would be left stale")
+    check(fake.classes[seed["target"]] == ["old"] and "delete Pts" in msg,
+          "the refused old copy is left untouched and the message says how to proceed")
+    seed = {"seed": []}
     (name, count), gdb = env.pull(_Layer(n=0), seed=seed)
-    check(count == 0 and "left in place" in fake.warnings[-1] and fake.classes[seed["target"]]
-          == ["old"], "an emptied layer says its old copy is stale and leaves it")
+    check(count == 0 and "nothing written" in fake.warnings[-1],
+          "an empty layer over an empty old copy completes with a warning")
     env.pull(_Layer(n=0))
     check("nothing written" in fake.warnings[-1], "an empty layer with no copy says nothing was written")
 
@@ -1842,14 +2023,36 @@ def _attachment_checks(t, env):
           "a list cut off at the server's cap is split until every attachment arrives"
           "  <-- pinned defect")
 
+    raises(lambda: env.att(_att_layer(att_count_fail=True)),
+           "a server that cannot count is refused unless the owner opts in  <-- pinned defect",
+           text="cannot count attachments")
+    raises(lambda: env.att(_att_layer(att_count_ignored=True)),
+           "a server that answers the count form with full lists is refused too",
+           text="cannot count attachments")
+    raises(lambda: env.att(_att_layer(att_count_http=503)),
+           "a 503 on the count form is a failure, not proof the server cannot count  "
+           "<-- pinned defect", exc=requests.HTTPError)
+    raises(lambda: env.att(_att_layer(att_count_http=429)),
+           "a 429 on the count form is a failure too", exc=requests.HTTPError)
+    raises(lambda: env.att(_att_layer(att_count_http=400)),
+           "a 400 on the count form means not supported, so it is refused as uncounted",
+           text="cannot count attachments")
+    mark = len(stub.hits)
+    raises(lambda: env.att(_att_layer(att_count_cap=False)),
+           "a layer that says it cannot count attachments is refused without being asked to",
+           text="cannot count attachments")
+    check(not [h for h in stub.hits[mark:] if h[2].get("returnCountOnly") == "true"],
+          "a layer whose supportsQueryAttachmentsCountOnly is false is not sent the count form")
+    summary, folder = env.att(_att_layer(att_count_cap=True))
+    check(summary["by_count"] == 3, "a layer that says it can count attachments is counted")
     capped = _att_layer(n=250, every=2, per=3, cap=30, att_cap=30, att_count_fail=True)
     mark = len(stub.hits)
-    summary, folder = env.att(capped)
+    summary, folder = env.att(capped, allow=True)
     check(summary["files"] == 375 and summary["by_cap"] > 0 and summary["by_count"] == 0
           and len([h for h in stub.hits[mark:] if h[2].get("returnCountOnly") == "true"]) == 1,
           "with no counts the cap rule splits a batch that reached the cap, and asks for "
           "counts once, not per batch")
-    summary, folder = env.att(_att_layer(att_count_ignored=True))
+    summary, folder = env.att(_att_layer(att_count_ignored=True), allow=True)
     check(summary["by_cap"] == 3 and summary["files"] == truth,
           "a server that answers the count query with full lists is treated as unable to count")
     summary, folder = env.att(_att_layer(n=250, every=7, per=2), token=None)
@@ -1875,6 +2078,9 @@ def _attachment_checks(t, env):
     summary, folder = env.att(_att_layer(att_nolen=True))
     check(summary["files"] == truth, "a body with no Content-Length is accepted on its size alone")
 
+    raises(lambda: env.att(_att_layer(ids_str=True)),
+           "a feature list holding ids that are not integers is refused  <-- pinned defect",
+           text="not an integer")
     raises(lambda: env.att(_att_layer(ids_short=True)),
            "a feature list one id short of the row count is refused  <-- pinned defect",
            text="ids for 250 rows")
@@ -1961,9 +2167,15 @@ def _service_checks(t, env):
 
     stub.layers[0].f["att_count_fail"] = True
     folder = tempfile.mkdtemp(dir=env.root)
-    download_service(env.base, folder, "Stub.gdb", attachments=True)
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+           "a run against a server that cannot count attachments fails by default",
+           text="Failed layers: Pts")
+    check("--allow-uncounted-attachments" in fake.errors[-1],
+          "the failure names the flag that accepts the weaker rule")
+    folder = tempfile.mkdtemp(dir=env.root)
+    download_service(env.base, folder, "Stub.gdb", attachments=True, allow_uncounted=True)
     check("cap rule alone" in fake.warnings[-1],
-          "a server that cannot count attachments is reported as weaker evidence")
+          "with the opt-in a server that cannot count attachments is reported as weaker evidence")
     stub.layers[0].f.pop("att_count_fail")
 
     tok = "s3+cr/et="
@@ -2007,14 +2219,42 @@ def _cli_checks(t, env):
               "main falls back to the CONFIG block when given nothing")
     check(main([env.base, folder, "att.gdb", "--attachments", "--resume"]) == 0,
           "main accepts --attachments and --resume together")
+    stub.layers = {0: _att_layer(n=20, att_count_fail=True)}
+    raises(lambda: main([env.base, folder, "unc.gdb", "--attachments"]),
+           "main refuses an uncounted attachment server by default", text="Failed layers")
+    check(main([env.base, folder, "unc.gdb", "--attachments", "--allow-uncounted-attachments",
+                "--delay", "0"]) == 0, "main accepts --allow-uncounted-attachments and --delay")
+    with _swapped("ALLOW_UNCOUNTED_ATTACHMENTS", True):
+        check(main([env.base, folder, "unc2.gdb", "--attachments"]) == 0,
+              "the CONFIG switch accepts an uncounted attachment server too")
+    stub.layers = {0: _Layer(n=12)}
+    tok = "env+tok/1="
+    stub.token = tok
+    os.environ["FULLPULL_TOKEN"] = tok
+    check(main([env.base, folder, "tok1.gdb"]) == 0,
+          "a token in FULLPULL_TOKEN reaches the server with no token argument")
+    del os.environ["FULLPULL_TOKEN"]
+    raises(lambda: main([env.base, folder, "tok2.gdb"]), "with no token anywhere the server refuses",
+           text="stub refuses")
+    with _swapped("sys", types.SimpleNamespace(stdin=io.StringIO(tok + "\n"), exit=sys.exit)):
+        check(main([env.base, folder, "tok3.gdb", "-"]) == 0,
+              "a token argument of - is read from standard input")
+    with _swapped("sys", types.SimpleNamespace(stdin=io.StringIO("\n"), exit=sys.exit)):
+        raises(lambda: main([env.base, folder, "tok4.gdb", "-"]),
+               "an empty standard input is no token", text="stub refuses")
+    stub.token = None
     check(_exit_code(lambda: _parser().parse_args(["u", "f", "--attach"])) == 2,
           "a prefix of --attachments is refused, not expanded  <-- pinned defect")
     with _swapped("SERVICE_URL", ""):
         check(_exit_code(lambda: main([])) == 2,
               "main with no service says what to set and exits 2")
-    with _swapped("arcpy", None):
+    with _swapped("arcpy", None), _swapped("ARCPY_LICENCE_ERROR", None):
         raises(lambda: main([env.base, folder]), "main without arcpy exits with the interpreter to use",
                exc=SystemExit, text="arcpy was not found")
+        with _swapped("ARCPY_LICENCE_ERROR", "The Product License has not been initialized."):
+            raises(lambda: main([env.base, folder]),
+                   "an arcpy that imports but fails its licence is not reported as missing  "
+                   "<-- pinned defect", exc=SystemExit, text="has not been initialized")
         raises(lambda: main(["--self-check-live"]), "--self-check-live without arcpy says so",
                exc=SystemExit, text="needs the real arcpy")
     stub.layers = {0: _Layer(n=2500, cap=1000)}
@@ -2041,7 +2281,7 @@ def self_check():
     root_url = "http://127.0.0.1:%d" % server.server_address[1]
     env = types.SimpleNamespace(stub=stub, fake=fake, root=root, root_url=root_url,
                                 base=root_url + "/svc/FeatureServer",
-                                session=make_session(retries=0), last_folder=None)
+                                session=make_session(retries=0, delay=0), last_folder=None)
     env.url = lambda lid: "%s/%d" % (env.base, lid)
 
     def pull(layer, where="1=1", seed=None):
@@ -2054,19 +2294,19 @@ def self_check():
         return download_layer(env.session, env.base, {"id": 0, "name": layer.name}, gdb,
                               None, set(), where=where), gdb
 
-    def attach(layer, token=None):
+    def attach(layer, token=None, allow=False):
         stub.layers = {0: layer}
         env.last_folder = tempfile.mkdtemp(dir=root)
         gdb = os.path.join(env.last_folder, "a.gdb")
         summary = pull_attachments(env.session, env.base, {"id": 0, "name": "Pts"}, "Pts", gdb,
-                                   len(layer.rows), token=token)
+                                   len(layer.rows), token=token, allow_uncounted=allow)
         return summary, env.last_folder
 
     env.pull, env.att = pull, attach
     saved_env = dict(os.environ)
     os.environ["NO_PROXY"] = "127.0.0.1"
     try:
-        with _swapped("arcpy", fake), _swapped("RETRIES", 0):
+        with _swapped("arcpy", fake), _swapped("RETRIES", 0), _swapped("DELAY", 0):
             _http_checks(t, env)
             stub.layers = {0: _Layer(n=2500, cap=1000)}
             _layer_checks(t, env.base, 0, tempfile.mkdtemp(dir=root))
@@ -2118,7 +2358,27 @@ def _parser():
                     help="Skip layers an earlier interrupted run already finished")
     ap.add_argument("--attachments", action="store_true",
                     help="Also download attachments, refusing any batch that came back short")
+    ap.add_argument("--delay", type=_seconds, default=None,
+                    help="Seconds between requests, to stay under a server's rate limit "
+                         "(default: DELAY in CONFIG)")
+    ap.add_argument("--allow-uncounted-attachments", action="store_true",
+                    help="Accept attachment lists checked only against the server cap, "
+                         "when the server cannot count them per feature")
     return ap
+
+
+def _seconds(text):
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("delay must be 0 or more seconds")
+    return value
+
+
+def _token(args):
+    """The token: standard input for "-", else the argument, else FULLPULL_TOKEN, else CONFIG."""
+    if args.token == "-":
+        return sys.stdin.readline().strip() or None
+    return args.token or os.environ.get("FULLPULL_TOKEN") or TOKEN or None
 
 
 def main(argv=None):
@@ -2139,6 +2399,11 @@ def main(argv=None):
     output_folder = args.output_folder or OUTPUT_FOLDER
     if not service_url or not output_folder:
         ap.error("set SERVICE_URL and OUTPUT_FOLDER in CONFIG, or pass them as arguments")
+    if arcpy is None and ARCPY_LICENCE_ERROR:
+        sys.exit(
+            "arcpy imported but raised: %s\nSign in to ArcGIS Pro, or set up its licence, "
+            "then run this again with the same Python." % ARCPY_LICENCE_ERROR
+        )
     if arcpy is None:
         # arcpy ships only with ArcGIS Pro's bundled Python, not a plain system install.
         # Without this, a first run on the wrong interpreter is an opaque import error.
@@ -2153,11 +2418,13 @@ def main(argv=None):
         service_url,
         output_folder,
         args.gdb_name or GDB_NAME or None,
-        token=args.token or TOKEN or None,
+        token=_token(args),
         out_sr=args.out_sr or OUT_SR or None,
         where=args.where or WHERE,
         resume=args.resume,
         attachments=args.attachments,
+        delay=args.delay,
+        allow_uncounted=args.allow_uncounted_attachments or ALLOW_UNCOUNTED_ATTACHMENTS,
     )
     return 0
 

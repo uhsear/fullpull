@@ -6,3 +6,5 @@ downloads/
 resp*.json
 download rest service.txt
 .coverage
+*.attachments/
+*.progress.json
