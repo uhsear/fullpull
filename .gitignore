@@ -8,3 +8,7 @@ download rest service.txt
 .coverage
 *.attachments/
 *.progress.json
+.env
+*.env
+credentials*
+*token*

@@ -223,7 +223,7 @@ arcpy. `arcpy` lives in Pro's bundled Python:
 ```
 
 `propy.bat` in `...\Pro\bin\Python\Scripts\` does the same. `requests` and `urllib3` ship with that
-environment. `--self-check` needs only Python 3.9 or later with `requests`. It starts its own stub.
+environment (checked on 2026-11-12: `requests` 2.32.5 and `urllib3` 2.5.0 import there). `--self-check` needs only Python 3.9 or later with `requests`. It starts its own stub.
 The file still tries `import arcpy` when it loads, and ignores a failed import, but the self-check
 never calls arcpy. On a host where `import arcpy` is missing, a real pull exits with the message
 above. Where it imports but raises, such as a Pro install whose licence is not initialised, a real
@@ -311,14 +311,15 @@ Every completed layer is recorded in `<geodatabase>.progress.json` next to the g
 atomically after each layer, with whether its attachments were pulled and the service URL, `--where`
 filter and output SR it was pulled with. A run that fails part way
 leaves that file behind. `--resume` reads it and skips the layers it names, provided the feature class
-is still there, the service, filter and output SR match, and, for a run with `--attachments`, the
+is still there and holds the recorded number of rows, the service, filter and output SR match, and, for a run with `--attachments`, the
 layer was recorded with its attachments. A layer that does not match is downloaded again. An entry
 written by an earlier release has none of these fields, so its layer is downloaded again too. A
 clean run deletes the file, so a scheduled `--resume` job cannot skip a whole service and report
 success without fetching a row.
 
-Resume trusts the earlier run's word that a layer finished. It does not re-verify the count against
-the server, and it does not check that the attachment folder is still there.
+Resume trusts the earlier run's word that a layer finished. It reads the row count of the local class
+but does not re-verify it against the server, and it does not check that the attachment folder is
+still there. Before it downloads any layer, it reserves the class names of the layers it will skip.
 
 ## Self-check
 
@@ -333,6 +334,8 @@ PASS  a unique prefix of a flag must be refused, not expanded  <-- pinned defect
 ...
 PASS  a repeated page is refused although the count matches  <-- pinned defect
 ...
+PASS  a geodatabase name gets .gdb added only when it lacks the suffix  <-- pinned defect
+...
 PASS  an attachment id of '../../x' is refused, so no id can steer a file or a URL  <-- pinned defect
 ...
 PASS  the notjson message never echoes the token, in either form  <-- pinned defect
@@ -344,6 +347,8 @@ PASS  a row added after the id list was read is refused on every strategy  <-- p
 PASS  a server that returns no count is refused, not trusted  <-- pinned defect
 ...
 PASS  a server that counts 0 while the old copy holds rows is refused, not kept stale on exit 0  <-- pinned defect
+...
+PASS  a server that counts 0 while its query returns rows is refused, not passed clean  <-- pinned defect
 ...
 PASS  attachment downloads obey --delay like every other request  <-- pinned defect
 ...
@@ -362,6 +367,14 @@ PASS  a feature list one id short of the row count is refused  <-- pinned defect
 PASS  an attachment named ../../evil.txt stays inside its feature's folder  <-- pinned defect
 ...
 PASS  urllib3's log line for a retried attachment download never carries the token  <-- pinned defect
+...
+PASS  a geodatabase name typed without .gdb still receives its layers  <-- pinned defect
+...
+PASS  a resume keeps both same-named layers instead of overwriting the finished one  <-- pinned defect
+...
+PASS  a resume downloads a layer again when its class no longer holds the recorded count  <-- pinned defect
+...
+PASS  a dry run reports a layer whose count of 0 its own query contradicts  <-- pinned defect
 ...
 PASS  a resume with another filter downloads the layer again, not 'already complete'  <-- pinned defect
 ...
@@ -384,10 +397,10 @@ PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-244 assertions, 0 failed
+256 assertions, 0 failed
 ```
 
-The full run prints all 244 assertions. Each `...` line is where this block is cut.
+The full run prints all 256 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -403,13 +416,13 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 244 |
-| Windows, ArcGIS conda env | 3.13.7 | 244 |
-| Windows, venv | 3.9.25 | 244 |
-| Windows, venv | 3.12.10 | 244 |
-| Linux | 3.12.3 | 244 |
+| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 256 |
+| Windows, ArcGIS conda env | 3.13.7 | 256 |
+| Windows, venv | 3.9.25 | 256 |
+| Windows, venv | 3.12.10 | 256 |
+| Linux | 3.12.3 | 256 |
 
-`C:\Python313` has no `requests` of its own. The 244 assertions ran there because `requests` comes
+`C:\Python313` has no `requests` of its own. The 256 assertions ran there because `requests` comes
 from the user site packages, and `PYTHONNOUSERSITE=1` or `-I` fails with `ModuleNotFoundError`. Run
 `python -m pip install requests` first on a bare interpreter.
 
@@ -425,7 +438,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,541 statements with none missed and 434 branches with none partial, 100 percent, on the
+reports 1,608 statements with none missed and 452 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -452,7 +465,10 @@ assertion group each: the user name and password refusal off, the missing `hasAt
 the resume comparison of service, filter and output SR off, and the skipped-layer warning turned
 back into a plain message. A fifth round turned it red for three more: the token mask
 on urllib3's log records off, the end-of-pull id check limited again to the offset strategy, and the
-warning-only pass for the strategies that cannot list ids removed.
+warning-only pass for the strategies that cannot list ids removed. A sixth round turned it red for
+four more: the `.gdb` suffix not added to a geodatabase name, the one-row query after a count of 0
+skipped, the recorded count of a resumed layer not compared, and the names of skipped layers not
+reserved before the downloads begin.
 
 ## Claims and where each was exercised
 
@@ -477,6 +493,9 @@ warning-only pass for the strategies that cannot list ids removed.
 | An uncounted attachment server, a 5xx on the count form, an id that is not an integer | stub with each fault in turn, `main()` with and without the opt-in |
 | Token from `FULLPULL_TOKEN` or standard input | `main()` against a stub that demands a token |
 | An empty server count over an old copy with rows is refused | stub layer with 0 rows over a seeded class |
+| A count of 0 that the layer's own query contradicts is refused, in a dry run too | stub that answers the count form with 0 while it holds 5 rows |
+| A geodatabase name typed without `.gdb` still receives its layers | `download_service` against a fake `CreateFileGDB` that adds the suffix as Esri documents |
+| A resume does not overwrite a finished layer that shares a name with a layer downloaded first | two same-named stub layers, the first refused in run 1 |
 | Requests are paced, attachment downloads included | assertions on the gap between request starts, on three timed downloads, and no sleep at 0 |
 | A row shifted across a page by a delete plus an add is not accepted | stub that deletes one row and adds one after page one; the next strategy refetches by id |
 | A token on the service URL is refused and never echoed | `download_service` against the stub with `?token=` and `#` tails; messages and the output folder scanned |
@@ -523,8 +542,10 @@ warning-only pass for the strategies that cannot list ids removed.
 - **Edits during a pull make the run refuse.** The attachment ID list is read once and the rows
   once, at different moments. A feature added between them fails the id-count check for that layer,
   so a busy layer can fail repeatedly and need a retry.
-- **A count of 0 cannot be told from a wrong answer of 0.** A layer with no old copy completes with
-  a warning. One with an old copy that holds rows is refused until you delete the old copy.
+- **A count of 0 is checked with one query.** After the server counts 0, the tool asks for one row.
+  A row, or an answer with no feature list, refuses the layer. A layer whose count and query both say
+  empty completes with a warning, and one with an old copy that holds rows is refused until you
+  delete the old copy.
 - **Duplicate attachment ids** from a server are not detected: the list check compares the number
   of ids with the number of rows, not the number of distinct ids. ArcGIS does not return duplicates.
 - **A body with neither `Content-Length` nor a listed `size` is not length-checked.** A connection
@@ -581,7 +602,15 @@ warning-only pass for the strategies that cannot list ids removed.
 - **`--self-check`, not `--self-test`.** The flag keeps its original name. `--self-test` exits 2 as
   an unrecognised argument, so a mechanical check that calls it will not pass.
 - **Name collisions are suffixed within one run only.** A second service pulled into the same
-  explicit geodatabase name replaces same-named layers from the first.
+  explicit geodatabase name replaces same-named layers from the first. A resume reserves the names
+  of the layers it skips before it downloads any other layer, so layers of one service that share a
+  name do not overwrite each other across runs.
+- **A resume checks the local copy only.** It skips a layer when its class exists and holds the
+  recorded count. It does not ask the server again, so a layer that changed on the server since
+  that run stays as it was.
+- **A geodatabase name without `.gdb` gets the suffix.** Esri's Create File Geodatabase page says
+  "If the output geodatabase name does not include the .gdb extension, it will be added", so fullpull adds it too and uses that name
+  for the class paths, the progress file and the attachment folder.
 - **A layer JSON that omits `hasAttachments`**, as a server before 10.1 does, fails the layer when
   `--attachments` is given, and the run exits 1 with a message that says the tool could not tell. A
   run without `--attachments` does not read the key.
@@ -607,11 +636,11 @@ warning-only pass for the strategies that cannot list ids removed.
   [Append](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/append.html)
   with `NO_TEST` lets the input schema differ from the target, and unmapped fields stay null.
   [Rename](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/rename.html)
-  fails if the new name exists, "even when the overwrite setting" is on, which is why the swap
-  deletes the old class first.
+  fails if the new name exists, even if the geoprocessing setting that allows tools to overwrite
+  existing datasets is enabled, which is why the swap deletes the old class first.
   [Create File Geodatabase](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/create-file-gdb.html)
-  creates a geodatabase in a folder that must exist. Its page does not say what happens when the
-  geodatabase exists, so the tool calls it only when `arcpy.Exists` says no.
+  creates a geodatabase in a folder that must exist and adds `.gdb` to a name that lacks it. Its page
+  does not say what happens when the geodatabase exists, so the tool calls it only when `arcpy.Exists` says no.
   [Get Count](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/get-count.html)
   returns a result read as `int(result[0])`.
   [CreateUniqueName](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/createuniquename.html),
@@ -639,6 +668,32 @@ warning-only pass for the strategies that cannot list ids removed.
 - **The numbers under "Notes from the original build"** are from one earlier run on a server that is
   not named here. The 254 s against 1.4 s figure in the file's docstring has the same status. They
   were not measured again.
+- **The offset strategy can call a short page an overlap.** When a server returns fewer rows than
+  asked, the offset advances by the rows returned, and the refusal can read "N row(s) came back
+  twice, so the pages overlap". The verdict is still a refusal, and the later strategies report the
+  real shortfall.
+- **`--self-check-live` writes only to its own temporary folder.** It creates a scratch geodatabase
+  there without `--apply`, deletes the folder afterwards, and never touches your output folder.
+  Esri edits the public sample layer, so its count drifts: it was 9,705 rows on 2026-11-11 and
+  9,709 on 2026-11-12.
+- **Keep the output folder path short.** An attachment is saved at
+  `<output folder>\<gdb>.attachments\<layer>\<oid>\<id>_<name>`, with the name cut to 100
+  characters. On Windows a path over 260 characters raises an `OSError`, which fails that layer with
+  the operating system's message instead of a verdict.
+- **A long attachment name loses its extension.** The cut to 100 characters keeps the start of the
+  name, so a name longer than that can end without its `.pdf` or `.jpg`.
+- **A listed attachment `size` that is not an integer is not checked.** The tool then compares only
+  `Content-Length`, when the server sends one.
+- **A `FULLPULL_TOKEN` with trailing white space is sent as typed.** Only the `-` standard-input
+  form is stripped. In `cmd.exe`, `set FULLPULL_TOKEN=abc ` keeps the trailing space, the server
+  rejects the token, and the run fails with exit 1.
+- **A `parentObjectId` that is a string** in an attachment answer raises a `TypeError` like the list
+  case, and an error body of the form `{"error": "text"}` raises an `AttributeError`. Each fails only
+  that layer or run with a Python-style message and exit 1. Real servers send an integer and an
+  object.
+- **`requests` reads proxy settings and `~/.netrc`.** `HTTP_PROXY` and `HTTPS_PROXY` send the
+  traffic through the proxy, which sees an `http://` request in full, and a `.netrc` entry for the
+  host adds a Basic `Authorization` header the tool did not choose to send.
 - **Related tables, coded value domains, date time zones, parallel fetching** are not handled.
   Conversion, not HTTP, is the bottleneck and `arcpy` is not thread safe.
 

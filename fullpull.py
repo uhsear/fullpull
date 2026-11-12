@@ -639,6 +639,31 @@ def layer_count(session, layer_url, label, where, token=None):
     return expected
 
 
+def zero_count_verdict(rows):
+    """Why a count of 0 cannot be believed, or None when the layer is empty.
+
+    rows is the "features" list of a one-row query made after the server counted 0. A row
+    there means the count and the query disagree. None for rows means the answer carried no
+    feature list, so the layer cannot be shown empty.
+    """
+    if not isinstance(rows, list):
+        return "its query answered with no feature list, so an empty layer cannot be confirmed"
+    if rows:
+        return "its query returned a row, so the count is wrong"
+    return None
+
+
+def probe_empty(session, layer_url, label, where, token=None):
+    """Raise when a layer the server counted as 0 records still returns a row."""
+    rows = rest_get(session, f"{layer_url}/query",
+                    {"where": where, "outFields": "*", "returnGeometry": "false",
+                     "resultRecordCount": "1"}, token=token).get("features")
+    problem = zero_count_verdict(rows)
+    if problem:
+        raise RuntimeError(
+            "%s: the server counts 0 records but %s; refusing the layer" % (label, problem))
+
+
 def recount_verdict(expected, now):
     """Why a pull is not whole when only the count can be rechecked, or None.
 
@@ -846,6 +871,7 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
                 "would be left stale. If the layer really is empty now, delete %s from the "
                 "geodatabase and run again" % (layer["name"], name, name)
             )
+        probe_empty(session, layer_url, layer["name"], where, token)
         arcpy.AddWarning(f"{layer['name']}: 0 records on server, nothing written.")
         return name, 0
 
@@ -1146,6 +1172,15 @@ def gdb_name_for(service_url):
     return f"{safe or 'OutputData'}.gdb"
 
 
+def with_gdb_suffix(name):
+    """The name Create File Geodatabase will give the geodatabase.
+
+    Esri documents that it adds ".gdb" when the name lacks it. The tool must use the same
+    name for every later path, or it writes to a workspace that does not exist.
+    """
+    return name if name.lower().endswith(".gdb") else name + ".gdb"
+
+
 def _progress_path(gdb):
     return gdb + ".progress.json"
 
@@ -1208,6 +1243,8 @@ def _dry_run(session, service_url, layers, token, where, attachments):
         try:
             layer_url = "%s/%s" % (service_url, layer["id"])
             count = layer_count(session, layer_url, layer["name"], where, token)
+            if count == 0:
+                probe_empty(session, layer_url, layer["name"], where, token)
             if attachments:
                 _has_listable_attachments(rest_get(session, layer_url, token=token),
                                           layer["name"])
@@ -1225,6 +1262,37 @@ def _dry_run(session, service_url, layers, token, where, attachments):
     if refused:
         raise RuntimeError("Layers that would be refused: " + "; ".join(n for n, _ in refused))
     return plan
+
+
+def _resumable(done, layers, asked, attachments, gdb, taken):
+    """{layer id: prior record} for the layers a resumed run may skip. Reserves their names.
+
+    A finished layer holds only what its run asked for: the same service, filter and output
+    SR. A layer finished without its attachments is not finished for a run that wants them.
+    The class must exist and hold the recorded count, because another layer of the same name
+    may have replaced it since.
+    """
+    skip = {}
+    for layer in layers:
+        prior = done.get(str(layer["id"]))
+        if not prior:
+            continue
+        if any(prior.get(k) != v for k, v in asked.items()):
+            arcpy.AddMessage("%s: the earlier run used a different service, filter or output "
+                             "SR, so the layer is downloaded again" % layer["name"])
+            continue
+        if attachments and not prior.get("attachments"):
+            continue
+        path = os.path.join(gdb, prior["name"])
+        held = int(arcpy.management.GetCount(path)[0]) if arcpy.Exists(path) else None
+        if held != prior["count"]:
+            arcpy.AddMessage("%s: the earlier copy %s holds %s rows, not the recorded %d, so "
+                             "the layer is downloaded again" % (
+                                 layer["name"], prior["name"], held, prior["count"]))
+            continue
+        taken.add(prior["name"].lower())
+        skip[str(layer["id"])] = prior
+    return skip
 
 
 def download_service(service_url, output_folder, gdb_name=None,
@@ -1268,7 +1336,7 @@ def download_service(service_url, output_folder, gdb_name=None,
     if not apply:
         return _dry_run(session, service_url, layers, token, where, attachments)
 
-    gdb_name = gdb_name or gdb_name_for(service_url)
+    gdb_name = with_gdb_suffix(gdb_name or gdb_name_for(service_url))
     gdb = os.path.join(output_folder, gdb_name)
     if not arcpy.Exists(gdb):
         arcpy.management.CreateFileGDB(output_folder, gdb_name)
@@ -1277,27 +1345,22 @@ def download_service(service_url, output_folder, gdb_name=None,
     # a name, and ValidateTableName can fold two distinct names onto one; without this the
     # second layer silently replaces the first and both report success.
     taken = set()
-    # Resume trusts the earlier run's word that a layer finished; it does not re-verify
-    # the count against the server. A layer that changed since that run stays as it was
-    # until the next full pull, which is the trade a resume makes.
+    # Resume trusts the earlier run's word that a layer finished; it checks the local class
+    # count but does not re-verify the count against the server. A layer that changed since
+    # that run stays as it was until the next full pull, which is the trade a resume makes.
     progress_path = _progress_path(gdb)
     done = _load_progress(progress_path) if resume else {}
+
+    # Decide every skip before any download. A layer downloaded early must not take the name
+    # a later, already complete layer holds, or it overwrites that layer's class.
+    asked = {"service": service_url, "where": where, "out_sr": str(out_sr) if out_sr else None}
+    skip = _resumable(done, layers, asked, attachments, gdb, taken)
 
     results, failures = [], []
     for layer in layers:
         key = str(layer["id"])
-        prior = done.get(key)
-        # A finished layer holds only what its run asked for: the same service, filter and
-        # output SR. A different ask means the old copy answers another question.
-        asked = {"service": service_url, "where": where, "out_sr": str(out_sr) if out_sr else None}
-        if prior and any(prior.get(k) != v for k, v in asked.items()):
-            arcpy.AddMessage("%s: the earlier run used a different service, filter or output "
-                             "SR, so the layer is downloaded again" % layer["name"])
-            prior = None
-        # A layer finished without its attachments is not finished for a run that wants them.
-        if prior and (prior.get("attachments") or not attachments) \
-                and arcpy.Exists(os.path.join(gdb, prior["name"])):
-            taken.add(prior["name"].lower())
+        prior = skip.get(key)
+        if prior:
             results.append((prior["name"], prior["count"]))
             arcpy.AddMessage(
                 f"{layer['name']}: already complete ({prior['count']} records), skipped"
@@ -1426,7 +1489,8 @@ class _FakeArcpy(object):
         return os.path.join(workspace, "%s_%d" % (base, self._serial))
 
     def _create_gdb(self, folder, name):
-        os.makedirs(os.path.join(folder, name))
+        # Esri: "If the output geodatabase name does not include the .gdb extension, it will be added."
+        os.makedirs(os.path.join(folder, name if name.lower().endswith(".gdb") else name + ".gdb"))
 
     def _delete(self, path):
         if self.skip_deletes and os.path.basename(path).startswith("stg_"):
@@ -1576,6 +1640,8 @@ class _Stub(object):
         f = layer.f
         rows = layer.select(p)
         if p.get("returnCountOnly") == "true":
+            if f.get("count_zero"):
+                return {"count": 0}
             return {} if f.get("no_count") else {"count": len(rows)}
         if p.get("returnIdsOnly") == "true":
             if f.get("ids_absent"):
@@ -1877,6 +1943,14 @@ def _pure_checks(t):
     check(note_ids({}, "OID", seen) == 0 and note_ids(page, None, set()) == 0,
           "a page with no features, or a layer with no OID field, repeats nothing")
 
+    check(zero_count_verdict([]) is None and "returned a row" in zero_count_verdict([{}]),
+          "a count of 0 stands only when the one-row query returns no row")
+    check("no feature list" in zero_count_verdict(None),
+          "an answer with no feature list cannot confirm an empty layer")
+    check(with_gdb_suffix("Parcels") == "Parcels.gdb" and with_gdb_suffix("Parcels.gdb") == "Parcels.gdb"
+          and with_gdb_suffix("P.GDB") == "P.GDB" and with_gdb_suffix("x.gdbx") == "x.gdbx.gdb",
+          "a geodatabase name gets .gdb added only when it lacks the suffix  <-- pinned defect")
+
     check(safe_filename("../../evil.txt") == "_.._evil.txt",
           "an attachment named with ../ cannot leave its folder  <-- pinned defect")
     check(safe_filename("a\\b:c.txt") == "a_b_c.txt", "a backslash or colon in a name becomes _")
@@ -2168,6 +2242,11 @@ def _strategy_checks(t, env):
           "an empty layer over an empty old copy completes with a warning")
     env.pull(_Layer(n=0))
     check("nothing written" in fake.warnings[-1], "an empty layer with no copy says nothing was written")
+    msg = raises(lambda: env.pull(_Layer(n=5, count_zero=True)),
+                 "a server that counts 0 while its query returns rows is refused, not passed clean"
+                 "  <-- pinned defect", text="its query returned a row")
+    check(not fake.classes.get(os.path.join(env.last_gdb, "Pts")) and "refusing the layer" in msg,
+          "the refused layer writes nothing")
 
     (name, count), gdb = env.pull(_Layer(n=300, paging=False, ids_fail="plain", oid_in_fields_only=True))
     check(count == 300 and "objectId range succeeded after 1 failed strategy" in fake.warnings[-1],
@@ -2493,6 +2572,53 @@ def _service_checks(t, env):
           and not os.path.exists(gdb + ".progress.json"),
           "resume skips what finished, redoes what did not, and removes its file")
 
+    # A name typed without .gdb: Create File Geodatabase adds it, so every path must carry it.
+    folder = tempfile.mkdtemp(dir=env.root)
+    results = download_service(env.base, folder, "NoSuffix", apply=True)
+    check(len(results) == 3 and os.listdir(folder) == ["NoSuffix.gdb"]
+          and len(fake.classes[os.path.join(folder, "NoSuffix.gdb", "Pts")]) == 30,
+          "a geodatabase name typed without .gdb still receives its layers  <-- pinned defect")
+
+    # Two layers share the name Pts. Layer 0 fails first, so layer 1 keeps the plain name.
+    # A resume downloads layer 0 first and must not take the name layer 1 already holds.
+    saved_layers = stub.layers
+    stub.layers = {0: _Layer(n=3, geom=False, no_count=True), 1: _Layer(n=7, geom=False)}
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", apply=True),
+           "the first run of two same-named layers fails on the uncounted one", text="Failed layers")
+    stub.layers[0] = _Layer(n=3, geom=False)
+    results = download_service(env.base, folder, "Stub.gdb", resume=True, apply=True)
+    check(sorted(c for _, c in results) == [3, 7] and len({n for n, _ in results}) == 2
+          and sorted(len(v) for k, v in fake.classes.items() if k.startswith(gdb)) == [3, 7],
+          "a resume keeps both same-named layers instead of overwriting the finished one"
+          "  <-- pinned defect")
+    stub.layers = {0: _Layer(n=2, geom=False, name="A"), 1: _Layer(n=4, geom=False, name="B")}
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    stub.layers[1].f["no_count"] = True
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", apply=True),
+           "a run with one refused layer leaves the other finished", text="Failed layers: B")
+    stub.layers[1].f.pop("no_count")
+    del fake.messages[:]
+    fake.classes[os.path.join(gdb, "A")] = [{}]
+    results = download_service(env.base, folder, "Stub.gdb", resume=True, apply=True)
+    check(results == [("A", 2), ("B", 4)] and "holds 1 rows, not the recorded 2" in " ".join(fake.messages)
+          and len(fake.classes[os.path.join(gdb, "A")]) == 2,
+          "a resume downloads a layer again when its class no longer holds the recorded count"
+          "  <-- pinned defect")
+    stub.layers = saved_layers
+
+    # Zero-count lie through the service: the dry run and --apply both refuse.
+    stub.layers = {0: _Layer(n=5, geom=False, count_zero=True)}
+    folder = tempfile.mkdtemp(dir=env.root)
+    raises(lambda: download_service(env.base, folder, "Stub.gdb"),
+           "a dry run reports a layer whose count of 0 its own query contradicts  <-- pinned defect",
+           text="Layers that would be refused: Pts")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", apply=True),
+           "--apply refuses the same layer", text="Failed layers: Pts")
+    stub.layers = saved_layers
+
     # Resume after a run with a filter: the default-filter run must not accept the filtered copy.
     stub.layers[1].f["no_count"] = True
     folder = tempfile.mkdtemp(dir=env.root)
@@ -2699,6 +2825,7 @@ def self_check():
         if seed is not None:
             seed["target"] = os.path.join(gdb, "Pts")
             fake.classes[seed["target"]] = seed["seed"]
+        env.last_gdb = gdb
         return download_layer(env.session, env.base, {"id": 0, "name": layer.name}, gdb,
                               None, set(), where=where), gdb
 
