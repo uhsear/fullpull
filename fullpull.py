@@ -1061,6 +1061,29 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
     return got
 
 
+def _has_listable_attachments(meta, name):
+    """True if the layer has attachments the server can list in batches, False if it has none.
+
+    Raises when the description cannot tell, or when the layer has attachments the server
+    does not advertise supportsQueryAttachments for. The dry run and --apply share this.
+    """
+    if "hasAttachments" not in meta:
+        raise RuntimeError(
+            "%s: the layer does not say whether it has attachments (no hasAttachments in its "
+            "description), so the tool cannot tell a layer with none from one it cannot list; "
+            "refusing rather than reporting none" % name
+        )
+    if not meta.get("hasAttachments"):
+        return False
+    if not (meta.get("advancedQueryCapabilities") or {}).get("supportsQueryAttachments"):
+        raise RuntimeError(
+            f"{name}: the layer has attachments but the server does not advertise "
+            "supportsQueryAttachments, so they cannot be listed in batches; refusing rather "
+            "than skipping them"
+        )
+    return True
+
+
 def pull_attachments(session, service_url, layer, name, gdb, expected, token=None, where="1=1",
                      allow_uncounted=False):
     """Download the attachments of a layer. Returns a summary dict, or None for a layer with none.
@@ -1071,20 +1094,8 @@ def pull_attachments(session, service_url, layer, name, gdb, expected, token=Non
     """
     layer_url = f"{service_url}/{layer['id']}"
     meta = rest_get(session, layer_url, token=token)
-    if "hasAttachments" not in meta:
-        raise RuntimeError(
-            "%s: the layer does not say whether it has attachments (no hasAttachments in its "
-            "description), so the tool cannot tell a layer with none from one it cannot list; "
-            "refusing rather than reporting none" % layer["name"]
-        )
-    if not meta.get("hasAttachments"):
+    if not _has_listable_attachments(meta, layer["name"]):
         return None
-    if not (meta.get("advancedQueryCapabilities") or {}).get("supportsQueryAttachments"):
-        raise RuntimeError(
-            f"{layer['name']}: the layer has attachments but the server does not advertise "
-            "supportsQueryAttachments, so they cannot be listed in batches; refusing rather "
-            "than skipping them"
-        )
     ids = rest_get(
         session, f"{layer_url}/query",
         {"where": where, "returnIdsOnly": "true"}, token=token,
@@ -1186,22 +1197,31 @@ def _report_attachments(layer, summary):
 
 
 def _dry_run(session, service_url, layers, token, where, attachments):
-    """Read each layer's record count and report the plan. Writes nothing."""
+    """Read each layer's record count and report the plan. Writes nothing.
+
+    It checks that the count answers and, with attachments, that the layer description
+    allows batch listing. It runs no paging strategy, so it cannot see a short read, a
+    repeated page or an uncounted attachment batch; only --apply checks those.
+    """
     plan, refused = [], []
     for layer in layers:
         try:
-            count = layer_count(session, "%s/%s" % (service_url, layer["id"]),
-                                layer["name"], where, token)
+            layer_url = "%s/%s" % (service_url, layer["id"])
+            count = layer_count(session, layer_url, layer["name"], where, token)
+            if attachments:
+                _has_listable_attachments(rest_get(session, layer_url, token=token),
+                                          layer["name"])
         except Exception as exc:
             refused.append((layer["name"], str(exc)))
             arcpy.AddError("%s: WOULD BE REFUSED - %s" % (layer["name"], exc))
             continue
         plan.append((layer["name"], count))
-        arcpy.AddMessage("%s: %d records on the server, would be pulled" % (layer["name"], count))
+        arcpy.AddMessage("%s: %d records on the server, count answered" % (layer["name"], count))
     arcpy.AddMessage(
-        "Dry run: %d layer(s) would be pulled%s, %d would be refused. Nothing was written. "
-        "Run again with --apply to download." % (
-            len(plan), " with their attachments" if attachments else "", len(refused)))
+        "Dry run: %d layer(s) answered the count%s, %d would be refused. Nothing was written. "
+        "A dry run cannot predict short reads, repeated pages or attachment gaps; --apply "
+        "checks those and refuses the layer." % (
+            len(plan), " and allow attachment listing" if attachments else "", len(refused)))
     if refused:
         raise RuntimeError("Layers that would be refused: " + "; ".join(n for n, _ in refused))
     return plan
@@ -2445,7 +2465,7 @@ def _service_checks(t, env):
     raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
            "a dry run reports a layer it would refuse and fails, so it cannot pass a bad service",
            text="Layers that would be refused: Pts")
-    check("WOULD BE REFUSED" in fake.errors[-1] and "with their attachments" in fake.messages[-1]
+    check("WOULD BE REFUSED" in fake.errors[-1] and "allow attachment listing" in fake.messages[-1]
           and os.listdir(folder) == [], "the dry run names the layer and still writes nothing")
     stub.layers[1].f.pop("no_count")
     folder = tempfile.mkdtemp(dir=env.root)
@@ -2517,7 +2537,15 @@ def _service_checks(t, env):
           "  <-- pinned defect")
     results = download_service(env.base, folder, "Stub.gdb", apply=True)
     check(len(results) == 3, "the same layer is pulled without --attachments")
+    folder = tempfile.mkdtemp(dir=env.root)
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+           "a dry run with attachments refuses a layer that does not say whether it has them"
+           "  <-- pinned defect", text="Layers that would be refused: Pts")
+    check("does not say whether it has attachments" in fake.errors[-1] and os.listdir(folder) == [],
+          "the dry run gives the same reason --apply gives and still writes nothing")
     stub.layers[1].f.pop("no_has_att")
+    check("cannot predict short reads" in " ".join(fake.messages),
+          "the dry run says it cannot predict short reads, so a clean preview is not a promise")
 
     stub.layers[0].f["att_count_fail"] = True
     folder = tempfile.mkdtemp(dir=env.root)

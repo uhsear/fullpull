@@ -146,8 +146,9 @@ too, because it goes into every request path.
 For a layer with `hasAttachments` the pass does this:
 
 1. Ask the server for the object ID list. It must be exactly as long as the verified row count. A
-   short list would hide whole features from the pass. Esri documents a limit of 1 million IDs in
-   that response, so a larger layer would refuse here the same way, not be partly pulled.
+   short list would hide whole features from the pass. Esri's Query page, under `returnIdsOnly`,
+   documents a limit of 1 million IDs in that response, so a larger layer would refuse here the
+   same way, not be partly pulled. The Query Attachments page states no limit of its own.
 2. Ask `queryAttachments` for a batch of at most `ATTACH_BATCH` features.
 3. Ask the same question with `returnCountOnly=true`, and compare, feature by feature, the count
    with the list. A feature the server counts but the list lacks, a feature listed twice or never
@@ -230,7 +231,8 @@ pull exits with the licence error text instead of a traceback or a claim that ar
 
 ## Usage
 
-Set the CONFIG block at the top of the file and run with no arguments:
+Set the CONFIG block at the top of the file and run with no arguments. A run without `--apply`
+(or `APPLY = True` in CONFIG) is a dry run that writes nothing. See "Dry run" below.
 
 ```python
 SERVICE_URL   = "https://example.gov/arcgis/rest/services/Public/Utilities/MapServer"
@@ -248,6 +250,7 @@ DELAY         = 0.5       # seconds between requests; 0 for your own server
 MAX_ENVELOPE_DEPTH = 12   # subdivisions before strategy 4 fetches a cell by ID list
 ATTACH_BATCH       = 100  # features per attachment query
 ALLOW_UNCOUNTED_ATTACHMENTS = False  # True accepts the cap rule alone
+APPLY         = False     # False is a dry run; True writes the geodatabase
 ```
 
 ```
@@ -262,6 +265,7 @@ propy fullpull.py <service_url> <output_folder> [gdb_name] [token] [out_sr] [whe
 
 | Flag | Does |
 |---|---|
+| `--apply` | Write. Without it the run lists the layers and the server's counts and writes nothing |
 | `--self-check` | Run the offline checks against a local stub and exit |
 | `--self-check-live` | Run the layer checks against `SELF_CHECK_URL`, a real server, and exit |
 | `--resume` | Skip layers an earlier interrupted run already finished |
@@ -285,10 +289,21 @@ To use it as an ArcGIS script tool, add it with the six positional parameters in
 tool passes parameters as positional arguments, so there is no separate code path. Flags are for the
 shell.
 
-A run writes by default. That is the earlier design and it is kept, because a script tool has no flag
-to hold a gate. What it protects is the existing copy: a layer is replaced only after its staging
-class passed the verdict. `--attachments` is opt-in and overwrites files of the same name. It does not
-delete files left by an earlier run.
+### Dry run and `--apply`
+
+Only `--apply` writes. A run without it reads the layer list, asks each layer for its record count,
+and with `--attachments` reads each layer's description to check that the server can list
+attachments in batches. It then prints how many layers answered, writes no geodatabase, class,
+progress file or attachment, and does not use `--resume`. It does not run a paging strategy, so it
+cannot see a short read, a repeated page or an uncounted attachment batch. Those are refused only
+by `--apply`. A clean dry run is therefore not a promise that `--apply` will succeed. A layer whose
+count fails, or whose description fails the attachment check, is named as "WOULD BE REFUSED" and the
+dry run fails with exit 1 and a Python traceback.
+
+With `--apply`, a layer is replaced only after its staging class passed the verdict. `--attachments`
+is opt-in and overwrites files of the same name. It does not delete files left by an earlier run.
+An ArcGIS script tool passes only the six positional parameters and no flag, so set `APPLY = True`
+in CONFIG there, or the run only reads.
 
 ## Resume
 
@@ -354,6 +369,8 @@ PASS  a resume that wants attachments does not skip a layer finished without the
 ...
 PASS  a layer that does not say whether it has attachments fails the run, not exit 0  <-- pinned defect
 ...
+PASS  a dry run with attachments refuses a layer that does not say whether it has them  <-- pinned defect
+...
 PASS  the token reaches no message, warning, error, progress file or output file  <-- pinned defect
 ...
 PASS  a service URL with a query string or fragment is refused  <-- pinned defect
@@ -367,10 +384,10 @@ PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-232 assertions, 0 failed
+244 assertions, 0 failed
 ```
 
-The full run prints all 232 assertions. Each `...` line is where this block is cut.
+The full run prints all 244 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -386,13 +403,13 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 232 |
-| Windows, ArcGIS conda env | 3.13.7 | 232 |
-| Windows, venv | 3.9.25 | 232 |
-| Windows, venv | 3.12.10 | 232 |
-| Linux | 3.12.3 | 232 |
+| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 244 |
+| Windows, ArcGIS conda env | 3.13.7 | 244 |
+| Windows, venv | 3.9.25 | 244 |
+| Windows, venv | 3.12.10 | 244 |
+| Linux | 3.12.3 | 244 |
 
-`C:\Python313` has no `requests` of its own. The 232 assertions ran there because `requests` comes
+`C:\Python313` has no `requests` of its own. The 244 assertions ran there because `requests` comes
 from the user site packages, and `PYTHONNOUSERSITE=1` or `-I` fails with `ModuleNotFoundError`. Run
 `python -m pip install requests` first on a bare interpreter.
 
@@ -408,7 +425,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,487 statements with none missed and 422 branches with none partial, 100 percent, on the
+reports 1,541 statements with none missed and 434 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -471,8 +488,14 @@ warning-only pass for the strategies that cannot list ids removed.
   because arcpy would not initialise here. The stand-in proves this tool calls them in the right
   order and reads the count back. It does not prove their behaviour. The earlier release's measured
   notes below came from real runs by its author.
-- **There is no `--apply` flag.** A run always writes the geodatabase, and only the staging swap
-  protects the previous copy of a layer. This is the earlier arcpy script-tool design, kept.
+- **A run without `--apply` lists layers and counts only.** It does not use `--resume`, and it does
+  not download or recount attachments. Its attachment check reads only the layer description.
+- **In a script tool, set `APPLY = True` in CONFIG, or the run only reads and writes nothing.**
+  A script tool passes no flag, and a dry run exits 0.
+- **The dry run still needs the ArcGIS Pro Python, although it reads only.** On a plain Python it
+  exits with "arcpy was not found" before it asks any question.
+- **After download the tool trusts the per-batch check and does not recount files on disk.** The sum
+  of the server's counts is not compared with the files found in the attachment folder.
 - **`--self-check-live` was not run.** It needs the real arcpy and network. Its layer checks run in
   `--self-check` against the stub, and `main(["--self-check-live"])` runs against the stub and exits 0.
 - **No counts, hidden cap.** When a server cannot answer `returnCountOnly`, a batch is checked only
@@ -509,7 +532,8 @@ warning-only pass for the strategies that cannot list ids removed.
 - **Resume compares the filter and output SR as typed.** Two spellings of the same filter count as
   different, and the layer is downloaded again. Use one output geodatabase per service and per
   filter anyway, because names in a shared geodatabase can still collide.
-- **Exit code 1 covers a refused layer, a crash, a missing arcpy and a licence failure.** Only the
+- **Exit code 1 covers a refused layer, a dry run that would refuse a layer, a crash, a missing arcpy
+  and a licence failure.** Only the
   message says which, so a scheduled job cannot tell "tool failed" from "findings exist" by the code
   alone. Argument errors exit 2.
 - **The mutation counts above come from by-hand edits that are not shipped,** so they cannot be
@@ -556,8 +580,6 @@ warning-only pass for the strategies that cannot list ids removed.
   `_report_attachments` and one self-check assertion) uses them too. It runs on Python 3.9 and later.
 - **`--self-check`, not `--self-test`.** The flag keeps its original name. `--self-test` exits 2 as
   an unrecognised argument, so a mechanical check that calls it will not pass.
-- **There is no `--apply`, and the rule is open.** House style says only `--apply` writes. This tool
-  writes on every run, and the owner has to either add the flag or accept the exception in writing.
 - **Name collisions are suffixed within one run only.** A second service pulled into the same
   explicit geodatabase name replaces same-named layers from the first.
 - **A layer JSON that omits `hasAttachments`**, as a server before 10.1 does, fails the layer when
@@ -576,10 +598,27 @@ warning-only pass for the strategies that cannot list ids removed.
   verdict holds, because the first batch with attachments flips the layer to "cannot count".
 - **The attachment download follows redirects to any host the server names.** That serves blob
   storage. The token is not forwarded, because it sits only in the first query string, but a hostile
-  server can make the client request any URL, an internal one included.
-- **Several relied-on arcpy behaviours have no Esri citation here:** `JSONToFeatures`, `Append`
-  (beyond `NO_TEST`), `Rename`, `CreateFileGDB`, `GetCount`, `CreateUniqueName`,
-  `ValidateTableName` and `Exists`. Whether Export Features accepts a REST layer URL was not checked.
+  server can make the client request any URL, an internal one included. Only point the tool at a
+  server you trust.
+- **Relied-on arcpy behaviours and their Esri pages** (read 2026-11-12; the pages say nothing
+  beyond the quotes below, and none of it was run against real arcpy):
+  [JSON To Features](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/conversion/json-to-features.html)
+  converts an Esri JSON file to "a feature class", which the tool relies on for each page.
+  [Append](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/append.html)
+  with `NO_TEST` lets the input schema differ from the target, and unmapped fields stay null.
+  [Rename](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/rename.html)
+  fails if the new name exists, "even when the overwrite setting" is on, which is why the swap
+  deletes the old class first.
+  [Create File Geodatabase](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/create-file-gdb.html)
+  creates a geodatabase in a folder that must exist. Its page does not say what happens when the
+  geodatabase exists, so the tool calls it only when `arcpy.Exists` says no.
+  [Get Count](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/get-count.html)
+  returns a result read as `int(result[0])`.
+  [CreateUniqueName](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/createuniquename.html),
+  [ValidateTableName](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/validatetablename.html)
+  and [Exists](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/exists.html) return a
+  unique name, a valid name and a Boolean. The Export Features page lists its input as a "Feature
+  Layer" and does not say whether a REST layer URL is accepted.
 - **Standalone tables rest on the in-memory stand-in only.** Esri's JSON To Features page documents
   an Output Feature Class and does not mention table input, and real arcpy would not initialise
   here, so a table pull was never run for real.
