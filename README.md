@@ -7,7 +7,7 @@ attachment batch that came back short.
 
 Picture a copy job that pulls a service of several layers into a geodatabase. Every layer prints a
 success line. Nobody sees a problem until someone notices the map is missing features. The original
-build of this tool ran the loop below against a live 11 layer service and watched exactly that.
+build of this tool ran the loop below against a live 11 layer service and watched exactly that. That run cannot be regenerated from this repository; see Limits.
 
 The job pages the obvious way:
 
@@ -164,7 +164,8 @@ For a layer with `hasAttachments` the pass does this:
    instead: the batch is taken when its answer is under the server's record cap, and the run warns
    that completeness rests on that rule alone.
 6. Every file is written to `.part`, checked, and renamed. A body whose length differs from its
-   `Content-Length`, or that is shorter than the `size` in the list, is refused and no file is kept.
+   `Content-Length`, that is shorter than the `size` in the list, or that is an ArcGIS
+   `{"error": {"code": ...}}` body sent with HTTP 200, is refused and no file is kept.
 
 A layer that has attachments but does not advertise `supportsQueryAttachments` is refused, not
 skipped. A run that fails on an attachment fails its layer and does not record it in the progress file.
@@ -359,6 +360,7 @@ PASS  a list cut off at the server's cap is split until every attachment arrives
 PASS  a server that cannot count is refused unless the owner opts in  <-- pinned defect
 ...
 PASS  a body cut short of its Content-Length is refused  <-- pinned defect
+PASS  an attachment GET answered 200 with an error body is refused, not saved  <-- pinned defect
 ...
 PASS  a feature list holding ids that are not integers is refused  <-- pinned defect
 ...
@@ -397,10 +399,10 @@ PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-256 assertions, 0 failed
+259 assertions, 0 failed
 ```
 
-The full run prints all 256 assertions. Each `...` line is where this block is cut.
+The full run prints all 259 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -416,13 +418,13 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 256 |
-| Windows, ArcGIS conda env | 3.13.7 | 256 |
-| Windows, venv | 3.9.25 | 256 |
-| Windows, venv | 3.12.10 | 256 |
-| Linux | 3.12.3 | 256 |
+| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 259 |
+| Windows, ArcGIS conda env | 3.13.7 | 259 |
+| Windows, venv | 3.9.25 | 259 |
+| Windows, venv | 3.12.10 | 259 |
+| Linux | 3.12.3 | 259 |
 
-`C:\Python313` has no `requests` of its own. The 256 assertions ran there because `requests` comes
+`C:\Python313` has no `requests` of its own. The 259 assertions ran there because `requests` comes
 from the user site packages, and `PYTHONNOUSERSITE=1` or `-I` fails with `ModuleNotFoundError`. Run
 `python -m pip install requests` first on a bare interpreter.
 
@@ -438,7 +440,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,608 statements with none missed and 452 branches with none partial, 100 percent, on the
+reports 1,623 statements with none missed and 456 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -548,6 +550,16 @@ reserved before the downloads begin.
   delete the old copy.
 - **Duplicate attachment ids** from a server are not detected: the list check compares the number
   of ids with the number of rows, not the number of distinct ids. ArcGIS does not return duplicates.
+- **A count-form answer that is not JSON is read as "cannot count".** An HTML page with HTTP 200
+  from a web application firewall is one example. The layer is refused by default. Under
+  `--allow-uncounted-attachments` the rest of that layer falls back to the cap rule without a
+  further warning.
+- **`returnExtentOnly` is documented by Esri for point layers only.** Esri's Query page says line
+  and polygon layers do not support it. The tool gates on `supportsReturningQueryExtent` alone, so
+  on those layers the quadtree strategy can fall back to the published extent.
+- **The error-body check on an attachment is a shape test.** A body of one chunk (up to 64 KB)
+  that is a JSON object with an `error` object holding a `code` is refused. A real attachment that
+  is exactly such a JSON file would be refused too. A larger body is never read as an error body.
 - **A body with neither `Content-Length` nor a listed `size` is not length-checked.** A connection
   closed early on such a body would be accepted.
 - **Resume compares the filter and output SR as typed.** Two spellings of the same filter count as
@@ -582,7 +594,9 @@ reserved before the downloads begin.
   capture, is not covered. Esri's header form was not checked.
 - **A service URL with `http://` sends the token in clear text.** The tool neither refuses nor
   warns. Use https.
-- **A non-JSON answer is quoted in the error.** The first 200 characters of the body go into the
+- **A non-JSON answer is quoted in the error.** The body is cut to 200 characters before the token
+  is removed, so a page that echoes the request body can show the first characters of a token that
+  straddles the cut. The first 200 characters of the body go into the
   message with the token removed, and the ArcGIS error message and details are scrubbed of the token
   the same way. Other server text, such as layer names, reaches the console as received, control
   characters included, and an uncaught failure prints a Python traceback. A server answer that is a

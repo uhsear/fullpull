@@ -715,6 +715,23 @@ def file_problem(declared, content_length, got):
     return None
 
 
+def error_body_problem(head):
+    """The message of an ArcGIS {"error": ...} body, or None if `head` is not one.
+
+    ArcGIS Server reports a failed request as HTTP 200 with this JSON, and an attachment GET is
+    no exception, so a dead token would otherwise be saved as the file.
+    """
+    try:
+        data = json.loads(head.decode("utf-8"))
+    except ValueError:
+        return None
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict) or "code" not in err:
+        return None
+    return "the server answered with an error body (code %s): %s" % (err.get("code"),
+                                                                      err.get("message"))
+
+
 def attachment_batch_problems(batch, groups, counts, cap):
     """Reasons a queryAttachments answer for `batch` cannot be trusted. [] means whole.
 
@@ -1058,7 +1075,7 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
     url = f"{layer_url}/{parent}/attachments/{info['id']}"
     path = os.path.join(folder, "%s_%s" % (info["id"], safe_filename(info.get("name"))))
     part = path + ".part"
-    got = 0
+    got, head = 0, b""
     if token:
         mask_token_in_logs(token)
     _pace(session)
@@ -1069,12 +1086,14 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
             resp.raise_for_status()
             with open(part, "wb") as fh:
                 for chunk in resp.iter_content(65536):
+                    head = head or chunk
                     fh.write(chunk)
                     got += len(chunk)
             length = resp.headers.get("Content-Length")
             if resp.headers.get("Content-Encoding") or not (length or "").isdigit():
                 length = None
-        problem = file_problem(info.get("size"), None if length is None else int(length), got)
+        problem = (error_body_problem(head) if got == len(head) else None) or file_problem(
+            info.get("size"), None if length is None else int(length), got)
         if problem:
             raise RuntimeError(problem)
         os.replace(part, path)
@@ -1743,6 +1762,8 @@ class _Stub(object):
         if f.get("att_drop") and not f.get("dropped"):
             f["dropped"] = True
             return 0, {}, b"", None
+        if f.get("att_err200"):
+            return 200, {"Content-Type": "application/json"}, json.dumps(_ERR).encode("ascii"), None
         if f.get("att_gzip"):
             return 200, {"Content-Encoding": "gzip"}, gzip.compress(data), None
         if f.get("att_short"):
@@ -2448,6 +2469,15 @@ def _attachment_checks(t, env):
            "a body shorter than the size the server lists is refused", text="of the")
     summary, folder = env.att(_att_layer(att_size_add=-1))
     check(summary["files"] == truth, "a body longer than the listed size is accepted")
+    raises(lambda: env.att(_att_layer(att_err200=True)),
+           "an attachment GET answered 200 with an error body is refused, not saved  "
+           "<-- pinned defect", text="error body")
+    check(not _files(env.last_folder), "a refused error body leaves no file behind")
+    check(error_body_problem(b'{"error": {"code": 498, "message": "Invalid token."}}')
+          .endswith("Invalid token.") and error_body_problem(bytes([255, 254])) is None
+          and error_body_problem(b"[1]") is None and error_body_problem(b'{"error": "x"}') is None
+          and error_body_problem(b'{"note": 1}') is None,
+          "only a JSON object with an error object that has a code counts as an error body")
     summary, folder = env.att(_att_layer(att_gzip=True))
     with open(_files(folder)[0], "rb") as fh:
         body = fh.read()
