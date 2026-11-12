@@ -29,8 +29,9 @@ row counts, the loop retrieves 8,500 of 30,700 records:
 | Layer C | 3,000 | 1,000 | 67% |
 | Layer D | 1,200 | 1,000 | 17% |
 
-The table was produced by running that loop against the stub of the self-check, not copied from a
-service.
+The table was produced by a one-off script that ran the naive 5,000-row stride loop against the stub
+of the self-check, with a cap of 1,000 rows per page on each layer. The self-check does not rerun
+it, so no command in this repository regenerates the table. It was not copied from a service.
 
 Fixing the stride fixed that failure. It left three quieter ones, and this round closes them:
 
@@ -80,12 +81,14 @@ verdict, `--resume`, and the attachment checks above.
   reports a dead or renamed service.
 - Output spatial reference pinned to the layer's own. A MapServer otherwise defaults to the map's.
 - Z and M requested only when the layer has them.
-- Standalone tables as well as feature layers. Group and non-queryable layers skipped and logged.
+- Feature layers. Group layers are skipped and logged. Other layer types that cannot be queried are
+  skipped with a warning. Standalone tables are attempted too; see Limits.
 - Name collisions suffixed rather than overwritten.
 - Four paging strategies, cheapest first. A strategy that raises, or that finishes with the wrong
   count, hands the layer to the next one. Only an exhausted list fails the layer.
 - `--resume` skips layers an interrupted run finished. A layer finished without attachments is not
-  skipped by a run that asks for them.
+  skipped by a run that asks for them, and a layer finished for another service, `--where` filter or
+  output SR is downloaded again.
 - Retries with backoff on 429 and 5xx, request timeouts, token support. The token travels in the
   POST body of every query, and in the URL only for the GET of an attachment. It is scrubbed from
   the attachment error messages and from the non-JSON and ArcGIS error messages.
@@ -97,7 +100,11 @@ verdict, `--resume`, and the attachment checks above.
   across a page boundary unread. An id the server holds that no page carried refuses that strategy,
   and the next one fetches by id.
 - A service URL with a query string or fragment, such as a token pasted from a browser address bar,
-  is refused before anything is written, and the message does not echo it.
+  is refused before anything is written, and the message does not echo it. So is a URL with a user
+  name or password in front of the host, which `requests` would put in its error text and the default
+  geodatabase name.
+- With `--attachments`, a layer whose description has no `hasAttachments` key fails the run, because
+  the tool cannot tell it from a layer with none.
 - A layer the server now counts as empty, while the geodatabase still holds rows for it, is refused
   rather than left stale. A layer with no old copy completes with a warning.
 
@@ -187,7 +194,11 @@ skipped. A run that fails on an attachment fails its layer and does not record i
   true, which fullpull does not read: it tries the request and falls back to the published extent.
   `outStatistics` takes `MIN` and `MAX`. fullpull does not rely on `exceededTransferLimit` to mark
   a last page: an offset pull ends on the server's own count, or on an empty page, and the count is
-  then checked.
+  then checked. `returnZ` and `returnM` default to false and apply only when `returnGeometry` is true
+  and the layer's `hasZ` or `hasM` is true, which is why fullpull asks for them only then.
+  `orderByFields` is "supported on only those layers/tables that indicate supportsAdvancedQueries is
+  true". fullpull sends it whenever it knows the OID field, and a refusal there hands the layer to
+  the next strategy.
   [Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)
 - `Append` with `NO_TEST` does not require the fields of the input to match the target, and fields
   that do not match are not mapped unless a field map says so.
@@ -281,9 +292,12 @@ delete files left by an earlier run.
 ## Resume
 
 Every completed layer is recorded in `<geodatabase>.progress.json` next to the geodatabase, written
-atomically after each layer, with whether its attachments were pulled. A run that fails part way
+atomically after each layer, with whether its attachments were pulled and the service URL, `--where`
+filter and output SR it was pulled with. A run that fails part way
 leaves that file behind. `--resume` reads it and skips the layers it names, provided the feature class
-is still there and, for a run with `--attachments`, the layer was recorded with its attachments. A
+is still there, the service, filter and output SR match, and, for a run with `--attachments`, the
+layer was recorded with its attachments. A layer that does not match is downloaded again. An entry
+written by an earlier release has none of these fields, so its layer is downloaded again too. A
 clean run deletes the file, so a scheduled `--resume` job cannot skip a whole service and report
 success without fetching a row.
 
@@ -339,13 +353,19 @@ PASS  a delay that is not a finite number is refused, not read as no pacing  <--
 ...
 PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 ...
+PASS  a resume with another filter downloads the layer again, not 'already complete'  <-- pinned defect
+...
+PASS  a layer that does not say whether it has attachments fails the run, not exit 0  <-- pinned defect
+...
+PASS  a service URL with a user name or password is refused  <-- pinned defect
+...
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-210 assertions, 0 failed
+223 assertions, 0 failed
 ```
 
-The full run prints all 210 assertions. Each `...` line is where this block is cut.
+The full run prints all 223 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -361,11 +381,15 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`) | 210 |
-| Windows, ArcGIS conda env | 3.13.7 | 210 |
-| Windows, venv | 3.9.25 | 210 |
-| Windows, venv | 3.12.10 | 210 |
-| Linux | 3.12.3 | 210 |
+| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 223 |
+| Windows, ArcGIS conda env | 3.13.7 | 223 |
+| Windows, venv | 3.9.25 | 223 |
+| Windows, venv | 3.12.10 | 223 |
+| Linux | 3.12.3 | 223 |
+
+`C:\Python313` has no `requests` of its own. The 223 assertions ran there because `requests` comes
+from the user site packages, and `PYTHONNOUSERSITE=1` or `-I` fails with `ModuleNotFoundError`. Run
+`python -m pip install requests` first on a bare interpreter.
 
 The counts are equal because the self-check never calls the real arcpy. On the Windows ArcGIS
 environment `import arcpy` raised `RuntimeError: The Product License has not been initialized` during
@@ -379,7 +403,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,380 statements with none missed and 390 branches with none partial, 100 percent, on the
+reports 1,414 statements with none missed and 400 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -401,7 +425,10 @@ null extent not guarded, a layer id not checked, the environment token ignored, 
 reported as a missing arcpy, feature ids not checked, the count capability ignored, no request
 pacing, and the licence text dropped. A third round turned it red for five more: the end-of-pull id
 check off, attachment downloads not paced, the query-string refusal off, the token left in the
-non-JSON message, and a delay of NaN accepted.
+non-JSON message, and a delay of NaN accepted. A fourth round turned it red for four more, one
+assertion group each: the user name and password refusal off, the missing `hasAttachments` check off,
+the resume comparison of service, filter and output SR off, and the skipped-layer warning turned
+back into a plain message.
 
 ## Claims and where each was exercised
 
@@ -467,9 +494,9 @@ non-JSON message, and a delay of NaN accepted.
   of ids with the number of rows, not the number of distinct ids. ArcGIS does not return duplicates.
 - **A body with neither `Content-Length` nor a listed `size` is not length-checked.** A connection
   closed early on such a body would be accepted.
-- **Resume does not record the filter, spatial reference or service.** A layer finished with one
-  `--where` is skipped by a later resume with another. Use one output geodatabase per service and
-  per filter.
+- **Resume compares the filter and output SR as typed.** Two spellings of the same filter count as
+  different, and the layer is downloaded again. Use one output geodatabase per service and per
+  filter anyway, because names in a shared geodatabase can still collide.
 - **Exit code 1 covers a refused layer, a crash, a missing arcpy and a licence failure.** Only the
   message says which, so a scheduled job cannot tell "tool failed" from "findings exist" by the code
   alone. Argument errors exit 2.
@@ -481,9 +508,11 @@ non-JSON message, and a delay of NaN accepted.
 - **A service URL with `http://` sends the token in clear text.** The tool neither refuses nor
   warns. Use https.
 - **A non-JSON answer is quoted in the error.** The first 200 characters of the body go into the
-  message with the token removed. Other server text that reaches a message or a traceback, such as
-  the ArcGIS error details, is not otherwise scrubbed, and an uncaught failure prints a Python
-  traceback.
+  message with the token removed, and the ArcGIS error message and details are scrubbed of the token
+  the same way. Other server text, such as layer names, reaches the console as received, control
+  characters included, and an uncaught failure prints a Python traceback. A server answer that is a
+  JSON list, or an error whose details are not strings, fails only that layer with a Python-style
+  message.
 - **A non-standard service URL** with no `/services/` segment makes the default geodatabase name from
   the whole URL, host and port included. Pass a name.
 - **A layer with no extent** gets no `outSR` from its extent. It is then asked for geometry in the
@@ -491,19 +520,24 @@ non-JSON message, and a delay of NaN accepted.
 - **Paging while the data changes.** Esri's Query page does not say that `resultOffset` pages stay
   stable while the data is edited. A shifted page shows up as a repeat, a short count or, by the end-of-pull id check, an unread id, and refuses.
 - **Attachment folders are not cleaned.** Files from an earlier run stay.
-- **`f`-strings remain.** This file predates the house style of `%` formatting and still holds
-  f-strings in the code that dates from the original build. It runs on Python 3.9 and later.
+- **`f`-strings remain.** This file predates the house style of `%` formatting. It still holds
+  f-strings in the code that dates from the original build, and the attachment code added for the
+  short-read upgrade (`pull_attachments`, `fetch_attachment_infos`, `download_attachment`,
+  `_report_attachments` and one self-check assertion) uses them too. It runs on Python 3.9 and later.
 - **`--self-check`, not `--self-test`.** The flag keeps its original name. `--self-test` exits 2 as
   an unrecognised argument, so a mechanical check that calls it will not pass.
 - **There is no `--apply`, and the rule is open.** House style says only `--apply` writes. This tool
   writes on every run, and the owner has to either add the flag or accept the exception in writing.
 - **Name collisions are suffixed within one run only.** A second service pulled into the same
   explicit geodatabase name replaces same-named layers from the first.
-- **A layer JSON that omits `hasAttachments`**, as a server before 10.1 does, is read as having no
-  attachments. With `--attachments` the run says so and exits 0 without being able to tell.
-- **Layer types other than Feature Layer and Table** are skipped as non-queryable with exit 0 and a
-  message. Whether an Annotation Layer should be pulled was not checked against Esri's layer-type
-  documentation.
+- **A layer JSON that omits `hasAttachments`**, as a server before 10.1 does, fails the layer when
+  `--attachments` is given, and the run exits 1 with a message that says the tool could not tell. A
+  run without `--attachments` does not read the key.
+- **Without `--attachments` the run does not warn that a layer has attachments.** The geodatabase
+  then holds rows without their photos and nothing in the output says so.
+- **Layer types other than Feature Layer and Table** are skipped as non-queryable with a warning and
+  exit 0. The closing "Done" line does not count them. Whether an Annotation Layer should be pulled
+  was not checked against Esri's layer-type documentation.
 - **A `parentObjectId` that is a list** in an attachment answer raises a `TypeError` that fails only
   that layer. Real servers return an integer.
 - **An attachment-free batch can count as checked against counts.** A server that ignores
@@ -513,9 +547,23 @@ non-JSON message, and a delay of NaN accepted.
 - **The attachment download follows redirects to any host the server names.** That serves blob
   storage. The token is not forwarded, because it sits only in the first query string, but a hostile
   server can make the client request any URL, an internal one included.
-- **Several relied-on behaviours have no Esri citation here:** `orderByFields` with `resultOffset`,
-  the defaults of `returnZ` and `returnM`, and the arcpy tools `JSONToFeatures`, `Rename`,
-  `CreateFileGDB`, `GetCount`, `CreateUniqueName`, `ValidateTableName` and `Exists`.
+- **Several relied-on arcpy behaviours have no Esri citation here:** `JSONToFeatures`, `Append`
+  (beyond `NO_TEST`), `Rename`, `CreateFileGDB`, `GetCount`, `CreateUniqueName`,
+  `ValidateTableName` and `Exists`. Whether Export Features accepts a REST layer URL was not checked.
+- **Standalone tables rest on the in-memory stand-in only.** Esri's JSON To Features page documents
+  an Output Feature Class and does not mention table input, and real arcpy would not initialise
+  here, so a table pull was never run for real.
+- **A file body longer than its listed size is kept.** The tool does not compare the response
+  `Content-Type` with the listed `contentType`, so an error page returned with HTTP 200 for a very
+  small attachment would be saved as that file.
+- **The swap is delete then rename.** An error between the two loses the old copy of that layer. A
+  lock fails the delete first, so this is rare.
+- **Only `FULLPULL_TOKEN` and the `-` standard-input form keep the token out of the process list and
+  the geoprocessing history.** The argument and CONFIG forms exist for script-tool compatibility.
+  Giving `-` with an empty standard input yields no token and ignores `FULLPULL_TOKEN`, and the run
+  then fails at the server with no hint that standard input was empty.
+- **`--self-check-live` sends three read-only requests to Esri's public sample server by default.**
+  Point `SELF_CHECK_URL` at your own server to avoid sending test traffic to someone else's.
 - **The numbers under "Notes from the original build"** are from one earlier run on a server that is
   not named here. The 254 s against 1.4 s figure in the file's docstring has the same status. They
   were not measured again.

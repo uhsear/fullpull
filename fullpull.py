@@ -252,7 +252,7 @@ def list_layers(session, service_url, token=None):
             arcpy.AddMessage(f"Skipping group layer {entry['id']}: {entry.get('name')}")
             continue
         if entry.get("type") not in (None, "Feature Layer", "Table"):
-            arcpy.AddMessage(
+            arcpy.AddWarning(
                 f"Skipping non-queryable layer {entry['id']}: "
                 f"{entry.get('name')} ({entry.get('type')})"
             )
@@ -984,6 +984,12 @@ def pull_attachments(session, service_url, layer, name, gdb, expected, token=Non
     """
     layer_url = f"{service_url}/{layer['id']}"
     meta = rest_get(session, layer_url, token=token)
+    if "hasAttachments" not in meta:
+        raise RuntimeError(
+            "%s: the layer does not say whether it has attachments (no hasAttachments in its "
+            "description), so the tool cannot tell a layer with none from one it cannot list; "
+            "refusing rather than reporting none" % layer["name"]
+        )
     if not meta.get("hasAttachments"):
         return None
     if not (meta.get("advancedQueryCapabilities") or {}).get("supportsQueryAttachments"):
@@ -1096,13 +1102,21 @@ def download_service(service_url, output_folder, gdb_name=None,
                      token=None, out_sr=None, where=None, resume=False, attachments=False,
                      delay=None, allow_uncounted=False):
     """Download every queryable layer of a service. Returns list of (name, count)."""
-    if urlparse(service_url).query or urlparse(service_url).fragment:
+    parts = urlparse(service_url)
+    if parts.query or parts.fragment:
         # A token pasted from a browser address bar would become part of the geodatabase
         # name, the progress file name and every error message, all written to disk or a log.
         raise RuntimeError(
             "The service URL has a query string or fragment (everything after a ? or #). "
             "Remove it, and pass any token through the FULLPULL_TOKEN environment variable "
             "or standard input (token argument -)."
+        )
+    if parts.username is not None or parts.password is not None:
+        # requests puts the full URL, password included, into its error text, and the default
+        # geodatabase name is built from the URL.
+        raise RuntimeError(
+            "The service URL carries a user name or password (user:password@ before the host). "
+            "Remove it, so the password cannot reach an error message or a file name."
         )
     service_url = service_url.rstrip("/")
     where = where or WHERE
@@ -1136,6 +1150,13 @@ def download_service(service_url, output_folder, gdb_name=None,
     for layer in layers:
         key = str(layer["id"])
         prior = done.get(key)
+        # A finished layer holds only what its run asked for: the same service, filter and
+        # output SR. A different ask means the old copy answers another question.
+        asked = {"service": service_url, "where": where, "out_sr": str(out_sr) if out_sr else None}
+        if prior and any(prior.get(k) != v for k, v in asked.items()):
+            arcpy.AddMessage("%s: the earlier run used a different service, filter or output "
+                             "SR, so the layer is downloaded again" % layer["name"])
+            prior = None
         # A layer finished without its attachments is not finished for a run that wants them.
         if prior and (prior.get("attachments") or not attachments) \
                 and arcpy.Exists(os.path.join(gdb, prior["name"])):
@@ -1154,7 +1175,7 @@ def download_service(service_url, output_folder, gdb_name=None,
                 _report_attachments(layer, pull_attachments(
                     session, service_url, layer, name, gdb, count, token=token, where=where,
                     allow_uncounted=allow_uncounted))
-            done[key] = {"name": name, "count": count, "attachments": bool(attachments)}
+            done[key] = dict(asked, name=name, count=count, attachments=bool(attachments))
             _save_progress(progress_path, done)
         except Exception as exc:
             failures.append((layer["name"], str(exc)))
@@ -1328,6 +1349,8 @@ class _Layer(object):
         if "att_count_cap" in self.f:
             out["advancedQueryCapabilities"]["supportsQueryAttachmentsCountOnly"] = \
                 self.f["att_count_cap"]
+        if self.f.get("no_has_att"):
+            del out["hasAttachments"]
         if not self.f.get("oid_in_fields_only"):
             out["objectIdField"] = "OBJECTID"
         if self.geom:
@@ -1826,8 +1849,10 @@ def _http_checks(t, env):
           == [(0, "Roads"), (5, "Layer_5"), (4, "Tbl"), (6, "Table_6")] and service_max == 2000,
           "layers and tables are listed, a missing name is made up, the service cap is returned")
     said = " ".join(env.fake.messages[before:])
-    check("Skipping group layer 2" in said and "Skipping non-queryable layer 3" in said,
-          "group and network layers are skipped and the skip is said aloud")
+    check("Skipping group layer 2" in said and "Skipping non-queryable layer 3" in " ".join(
+        env.fake.warnings), "group and network layers are skipped and the skip is said aloud")
+    check("Skipping non-queryable layer 3" not in said,
+          "a skipped layer that may hold data is a warning, not a plain message  <-- pinned defect")
     env.stub.extra, env.stub.extra_tables = [], []
     for bad in ("../x", True):
         env.stub.extra = [{"id": bad, "name": "Bad"}]
@@ -2162,8 +2187,10 @@ def _attachment_checks(t, env):
     summary, folder = env.att(_att_layer(att_size_add=-1))
     check(summary["files"] == truth, "a body longer than the listed size is accepted")
     summary, folder = env.att(_att_layer(att_gzip=True))
-    check(summary["files"] == truth and open(_files(folder)[0], "rb").read()
-          .startswith(b"data-"), "a gzip body is decoded and its Content-Length not compared")
+    with open(_files(folder)[0], "rb") as fh:
+        body = fh.read()
+    check(summary["files"] == truth and body.startswith(b"data-"),
+          "a gzip body is decoded and its Content-Length not compared")
     summary, folder = env.att(_att_layer(att_nolen=True))
     check(summary["files"] == truth, "a body with no Content-Length is accepted on its size alone")
 
@@ -2239,6 +2266,22 @@ def _service_checks(t, env):
           and not os.path.exists(gdb + ".progress.json"),
           "resume skips what finished, redoes what did not, and removes its file")
 
+    # Resume after a run with a filter: the default-filter run must not accept the filtered copy.
+    stub.layers[1].f["no_count"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    gdb = os.path.join(folder, "Stub.gdb")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb",
+                                    where="OBJECTID >= 1 AND OBJECTID <= 3"),
+           "a filtered run with a refused layer fails", text="Failed layers: Pts")
+    stub.layers[1].f.pop("no_count")
+    results = download_service(env.base, folder, "Stub.gdb", resume=True)
+    check(results[0] == ("Pts", 30) and "different service, filter" in " ".join(fake.messages),
+          "a resume with another filter downloads the layer again, not 'already complete'"
+          "  <-- pinned defect")
+    check(len(fake.classes[os.path.join(gdb, "Pts")]) == 30,
+          "the layer holds every row the server has, not the earlier filter's three"
+          "  <-- pinned defect")
+
     # Finished without attachments, resumed with them: the layer must not be skipped.
     stub.layers[1].f["no_count"] = True
     folder = tempfile.mkdtemp(dir=env.root)
@@ -2253,6 +2296,18 @@ def _service_checks(t, env):
           and "1 batch(es) checked against the server's per-feature counts, 0 against the server cap only"
           in " ".join(fake.messages),
           "the run says which layers had attachments and how they were checked")
+
+    # A layer description without hasAttachments cannot be told from a layer with none.
+    stub.layers[1].f["no_has_att"] = True
+    folder = tempfile.mkdtemp(dir=env.root)
+    msg = raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+                 "a layer that does not say whether it has attachments fails the run, not exit 0"
+                 "  <-- pinned defect", text="Failed layers: Pts")
+    check("does not say whether it has attachments" in fake.errors[-1],
+          "the failure says the tool could not tell")
+    results = download_service(env.base, folder, "Stub.gdb")
+    check(len(results) == 3, "the same layer is pulled without --attachments")
+    stub.layers[1].f.pop("no_has_att")
 
     stub.layers[0].f["att_count_fail"] = True
     folder = tempfile.mkdtemp(dir=env.root)
@@ -2294,6 +2349,15 @@ def _service_checks(t, env):
                      text="query string or fragment")
         check("SECRETTOKEN123" not in msg and sorted(os.listdir(folder)) == held,
               "the refusal neither echoes the token nor writes a geodatabase or progress file")
+    held = sorted(os.listdir(folder))
+    secret = env.base.replace("http://", "http://admin:SECRETPW@")
+    for url in (secret, env.base.replace("http://", "http://admin@"),
+                env.base.replace("http://", "http://:SECRETPW@")):
+        msg = raises(lambda: download_service(url, folder),
+                     "a service URL with a user name or password is refused  <-- pinned defect",
+                     text="user name or password")
+        check("SECRETPW" not in msg and sorted(os.listdir(folder)) == held,
+              "the refusal neither echoes the password nor writes a geodatabase or progress file")
     raises(lambda: download_service(env.base, os.path.join(folder, "nope")),
            "a missing output folder is refused", text="does not exist")
     raises(lambda: download_service(env.root_url + "/misc/nolayers", folder),
