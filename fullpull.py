@@ -23,6 +23,9 @@ and a server that returns no count at all is refused because completeness cannot
 --attachments pulls the attachment files too, and refuses a batch of features whose
 attachment list came back short of the server's own per-feature count.
 
+A run without --apply only reads: it lists the layers and the server's counts and writes
+nothing. --apply lets it create the geodatabase and replace layer classes.
+
 Edit the CONFIG block below and run with no arguments, or pass everything on the command
 line. Command-line arguments win over CONFIG when both are set.
 
@@ -30,10 +33,11 @@ A token is read from the FULLPULL_TOKEN environment variable, or from standard i
 the token argument is "-". A token typed as an argument shows in the process list.
 
     python fullpull.py                          # uses CONFIG below
-    python fullpull.py <service_url> <output_folder>
-    python fullpull.py <service_url> <output_folder> --resume
-    python fullpull.py <service_url> <output_folder> --attachments
-    python fullpull.py <service_url> <output_folder> --delay 1
+    python fullpull.py <service_url> <output_folder>             # dry run, writes nothing
+    python fullpull.py <service_url> <output_folder> --apply
+    python fullpull.py <service_url> <output_folder> --apply --resume
+    python fullpull.py <service_url> <output_folder> --apply --attachments
+    python fullpull.py <service_url> <output_folder> --apply --delay 1
     python fullpull.py --self-check
     python fullpull.py --self-check-live        # the same layer checks against SELF_CHECK_URL
 """
@@ -109,6 +113,11 @@ WHERE = "1=1"
 # ~3.6k records/sec, most of the available throughput at a fraction of the memory.
 # Raising this trades memory and 500-risk for a little speed.
 MAX_PAGE = 5_000
+
+# False means a dry run: the tool lists the layers and the server's counts and writes
+# nothing. True lets it create the geodatabase and replace layer classes, the same as
+# passing --apply. An ArcGIS script tool cannot pass a flag, so set True here for one.
+APPLY = False
 
 # Seconds before a single HTTP request is abandoned, and how many times to retry it
 # with exponential backoff on 429/500/502/503/504.
@@ -612,6 +621,36 @@ def current_ids(session, layer_url, where, token=None):
     return ids if isinstance(ids, list) else None
 
 
+def layer_count(session, layer_url, label, where, token=None):
+    """The server's own record count for `where`. Raises when it gives none.
+
+    No count means nothing to verify against. Accepting whatever arrives would be the false
+    clean this tool exists to prevent, so a layer the server cannot count is refused.
+    """
+    expected = rest_get(
+        session, f"{layer_url}/query",
+        {"where": where, "returnCountOnly": "true"}, token=token,
+    ).get("count")
+    if not isinstance(expected, int):
+        raise RuntimeError(
+            "%s: the server returned no record count, so completeness cannot be verified; "
+            "refusing the layer" % label
+        )
+    return expected
+
+
+def recount_verdict(expected, now):
+    """Why a pull is not whole when only the count can be rechecked, or None.
+
+    expected is the count before the pull, now the count after it. Used when the server
+    cannot list its object ids, so the ids read cannot be compared with the ids held.
+    """
+    if now != expected:
+        return ("the server counted %d records before the pull and %d after it, so the layer "
+                "changed while it was being pulled" % (expected, now))
+    return None
+
+
 def note_ids(page, oid, seen):
     """Add a page's objectIds to `seen`. Returns how many were already there.
 
@@ -791,17 +830,7 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
     # publishes supportsPagination explicitly, so the fast path is unaffected.
     paged = (meta.get("advancedQueryCapabilities") or {}).get("supportsPagination", False)
 
-    expected = rest_get(
-        session, f"{layer_url}/query",
-        {"where": where, "returnCountOnly": "true"}, token=token,
-    ).get("count")
-    # No count means nothing to verify against. Accepting whatever arrives would be the
-    # false clean this tool exists to prevent, so a layer the server cannot count is refused.
-    if not isinstance(expected, int):
-        raise RuntimeError(
-            "%s: the server returned no record count, so completeness cannot be verified; "
-            "refusing the layer" % layer["name"]
-        )
+    expected = layer_count(session, layer_url, layer["name"], where, token)
 
     name = unique_name(layer["name"], gdb, taken)
     target = os.path.join(gdb, name)
@@ -887,9 +916,10 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
             # their id list or id window once, so a row added after that read is never
             # asked for while the count still matches the earlier figure. Every strategy
             # therefore compares the server's ids now with the ids it read. Only the offset
-            # strategy refuses when the list cannot be had: the others exist for servers
-            # that cannot list ids, so they pass with a warning. Without an OID field there
-            # is nothing to compare, which the README names.
+            # strategy refuses when the list cannot be had. The others exist for servers
+            # that cannot list ids, so they fall back to comparing the record count taken
+            # before the pull with the count now, and refuse when that cannot be had either.
+            # Without an OID field there is nothing to compare, which the README names.
             unchecked = False
             if not problem and oid:
                 try:
@@ -899,7 +929,9 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
                         raise
                     now = None
                 if now is None and not shifts:
-                    unchecked = True
+                    problem = recount_verdict(
+                        expected, layer_count(session, layer_url, layer["name"], where, token))
+                    unchecked = not problem
                 else:
                     problem = unread_verdict(now, seen_ids)
             if problem:
@@ -914,8 +946,9 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
         got = count
         if unchecked:
             arcpy.AddWarning(
-                "%s: the server gave no object id list after the %s pull, so a row added "
-                "during the pull cannot be ruled out" % (layer["name"], label))
+                "%s: the server gave no object id list after the %s pull, so only its record "
+                "count was rechecked. A row added while another was deleted cannot be ruled out"
+                % (layer["name"], label))
         if index:
             # Never let a fallback pass silently. A layer that needs the quadtree is a
             # layer whose server is misreporting something, and that is worth knowing.
@@ -1152,10 +1185,37 @@ def _report_attachments(layer, summary):
         )
 
 
+def _dry_run(session, service_url, layers, token, where, attachments):
+    """Read each layer's record count and report the plan. Writes nothing."""
+    plan, refused = [], []
+    for layer in layers:
+        try:
+            count = layer_count(session, "%s/%s" % (service_url, layer["id"]),
+                                layer["name"], where, token)
+        except Exception as exc:
+            refused.append((layer["name"], str(exc)))
+            arcpy.AddError("%s: WOULD BE REFUSED - %s" % (layer["name"], exc))
+            continue
+        plan.append((layer["name"], count))
+        arcpy.AddMessage("%s: %d records on the server, would be pulled" % (layer["name"], count))
+    arcpy.AddMessage(
+        "Dry run: %d layer(s) would be pulled%s, %d would be refused. Nothing was written. "
+        "Run again with --apply to download." % (
+            len(plan), " with their attachments" if attachments else "", len(refused)))
+    if refused:
+        raise RuntimeError("Layers that would be refused: " + "; ".join(n for n, _ in refused))
+    return plan
+
+
 def download_service(service_url, output_folder, gdb_name=None,
                      token=None, out_sr=None, where=None, resume=False, attachments=False,
-                     delay=None, allow_uncounted=False):
-    """Download every queryable layer of a service. Returns list of (name, count)."""
+                     delay=None, allow_uncounted=False, apply=False):
+    """Download every queryable layer of a service. Returns list of (name, count).
+
+    Without apply this only reads: it lists the layers and the server's own counts, writes
+    nothing to disk and returns what it would pull. Only apply creates the geodatabase,
+    replaces layer classes, writes the progress file and pulls attachments.
+    """
     parts = urlparse(service_url)
     if parts.query or parts.fragment:
         # A token pasted from a browser address bar would become part of the geodatabase
@@ -1184,6 +1244,9 @@ def download_service(service_url, output_folder, gdb_name=None,
     layers, service_max = list_layers(session, service_url, token=token)
     if not layers:
         raise RuntimeError(f"No queryable layers or tables found at {service_url}")
+
+    if not apply:
+        return _dry_run(session, service_url, layers, token, where, attachments)
 
     gdb_name = gdb_name or gdb_name_for(service_url)
     gdb = os.path.join(output_folder, gdb_name)
@@ -1223,7 +1286,6 @@ def download_service(service_url, output_folder, gdb_name=None,
         try:
             name, count = download_layer(session, service_url, layer, gdb, service_max,
                                          taken, token=token, out_sr=out_sr, where=where)
-            results.append((name, count))
             arcpy.AddMessage(f"{layer['name']}: {count} records -> {os.path.join(gdb, name)}")
             if attachments:
                 _report_attachments(layer, pull_attachments(
@@ -1231,6 +1293,7 @@ def download_service(service_url, output_folder, gdb_name=None,
                     allow_uncounted=allow_uncounted))
             done[key] = dict(asked, name=name, count=count, attachments=bool(attachments))
             _save_progress(progress_path, done)
+            results.append((name, count))
         except Exception as exc:
             failures.append((layer["name"], str(exc)))
             arcpy.AddError(f"{layer['name']}: FAILED - {exc}")
@@ -1546,7 +1609,7 @@ class _Stub(object):
         """Another editor adds one row right after the answer named by `moment` was built."""
         if layer.f.get("add_after") == moment and not layer.f.get("added"):
             layer.f["added"] = True
-            layer.rows.append({"oid": max(r["oid"] for r in layer.rows) + 1,
+            layer.rows.append({"oid": layer.f.get("add_oid") or max(r["oid"] for r in layer.rows) + 1,
                                "x": 1.0, "y": 1.0, "geom": True})
 
     def query_attachments(self, layer, p):
@@ -2038,6 +2101,14 @@ def _strategy_checks(t, env):
                  "<-- pinned defect", text="every strategy failed")
     check("objectId range: 1 row(s) the server holds now were never read (first id 31)" in msg,
           "the range strategy names the row its windows never reached")
+    msg = raises(lambda: env.pull(_Layer(n=2500, cap=1000, paging=False, ids_absent=True,
+                                       add_after="stats", add_oid=9000)),
+                 "a row added far above the id window is refused when the server lists no ids  "
+                 "<-- pinned defect", text="every strategy failed")
+    check("objectId range: the server counted 2500 records before the pull and 2501 after it"
+          in msg, "with no id list the range strategy rechecks the record count")
+    check(recount_verdict(5, 5) is None and "7 after" in recount_verdict(5, 7),
+          "an unchanged count passes the recount and a changed one is named")
     (name, count), gdb = env.pull(_Layer(n=30, ids_fail_once=True))
     check(count == 30 and "resultOffset paging: ArcGIS error" in fake.warnings[0],
           "an id list that fails after an offset pull is a failure of that strategy, not a pass")
@@ -2356,31 +2427,48 @@ def _service_checks(t, env):
     stub.extra = [{"id": 2, "name": "Grp", "subLayerIds": [0]}]
     folder = tempfile.mkdtemp(dir=env.root)
     gdb = os.path.join(folder, "Stub.gdb")
-    results = download_service(env.base, folder, "Stub.gdb")
+    results = download_service(env.base, folder, "Stub.gdb", apply=True)
     check(results == [("Pts", 30), ("Pts_2", 5), ("Tbl", 2)] and os.path.isdir(gdb),
           "a service pulls every layer and table under collision-free names")
     check(not os.path.exists(gdb + ".progress.json") and not os.path.exists(gdb + ".attachments"),
           "a clean run deletes its progress file and writes no attachments unless asked")
 
+    # Without apply nothing may be written, however the call is made.
+    folder = tempfile.mkdtemp(dir=env.root)
+    classes_before = len(fake.classes)
+    plan = download_service(env.base, folder, "Stub.gdb")
+    check([c for _, c in plan] == [30, 5, 2] and os.listdir(folder) == []
+          and len(fake.classes) == classes_before and "Nothing was written" in fake.messages[-1],
+          "a run without apply reads the counts and writes no geodatabase, class or file"
+          "  <-- pinned defect")
+    stub.layers[1].f["no_count"] = True
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+           "a dry run reports a layer it would refuse and fails, so it cannot pass a bad service",
+           text="Layers that would be refused: Pts")
+    check("WOULD BE REFUSED" in fake.errors[-1] and "with their attachments" in fake.messages[-1]
+          and os.listdir(folder) == [], "the dry run names the layer and still writes nothing")
+    stub.layers[1].f.pop("no_count")
+    folder = tempfile.mkdtemp(dir=env.root)
+
     # Another process removes the progress file between the last layer and the cleanup.
     folder = tempfile.mkdtemp(dir=env.root)
     gdb = os.path.join(folder, "Stub.gdb")
     fake.on_message = lambda text: text.startswith("Done.") and os.remove(gdb + ".progress.json")
-    results = download_service(env.base, folder, "Stub.gdb")
+    results = download_service(env.base, folder, "Stub.gdb", apply=True)
     fake.on_message = None
     check(len(results) == 3, "a progress file that vanished before the cleanup does not fail a clean run")
 
     stub.layers[1].f["no_count"] = True
     folder = tempfile.mkdtemp(dir=env.root)
     gdb = os.path.join(folder, "Stub.gdb")
-    raises(lambda: download_service(env.base, folder, "Stub.gdb"),
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", apply=True),
            "one refused layer fails the run, so a scheduled job cannot report success",
            text="Failed layers: Pts")
     check(sorted(_load_progress(gdb + ".progress.json")) == ["0", "4"]
           and "FAILED" in fake.errors[-1],
           "the progress file keeps the layers that finished and the error names the one that did not")
     stub.layers[1].f.pop("no_count")
-    results = download_service(env.base, folder, "Stub.gdb", resume=True)
+    results = download_service(env.base, folder, "Stub.gdb", resume=True, apply=True)
     check(results[0] == ("Pts", 30) and "already complete" in " ".join(fake.messages)
           and not os.path.exists(gdb + ".progress.json"),
           "resume skips what finished, redoes what did not, and removes its file")
@@ -2390,10 +2478,10 @@ def _service_checks(t, env):
     folder = tempfile.mkdtemp(dir=env.root)
     gdb = os.path.join(folder, "Stub.gdb")
     raises(lambda: download_service(env.base, folder, "Stub.gdb",
-                                    where="OBJECTID >= 1 AND OBJECTID <= 3"),
+                                    where="OBJECTID >= 1 AND OBJECTID <= 3", apply=True),
            "a filtered run with a refused layer fails", text="Failed layers: Pts")
     stub.layers[1].f.pop("no_count")
-    results = download_service(env.base, folder, "Stub.gdb", resume=True)
+    results = download_service(env.base, folder, "Stub.gdb", resume=True, apply=True)
     check(results[0] == ("Pts", 30) and "different service, filter" in " ".join(fake.messages),
           "a resume with another filter downloads the layer again, not 'already complete'"
           "  <-- pinned defect")
@@ -2405,9 +2493,9 @@ def _service_checks(t, env):
     stub.layers[1].f["no_count"] = True
     folder = tempfile.mkdtemp(dir=env.root)
     gdb = os.path.join(folder, "Stub.gdb")
-    raises(lambda: download_service(env.base, folder, "Stub.gdb"), "the plain run fails on layer 1")
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", apply=True), "the plain run fails on layer 1")
     stub.layers[1].f.pop("no_count")
-    download_service(env.base, folder, "Stub.gdb", resume=True, attachments=True)
+    download_service(env.base, folder, "Stub.gdb", resume=True, attachments=True, apply=True)
     check(len(_files(os.path.join(gdb + ".attachments", "Pts"))) == 10,
           "a resume that wants attachments does not skip a layer finished without them"
           "  <-- pinned defect")
@@ -2419,24 +2507,27 @@ def _service_checks(t, env):
     # A layer description without hasAttachments cannot be told from a layer with none.
     stub.layers[1].f["no_has_att"] = True
     folder = tempfile.mkdtemp(dir=env.root)
-    msg = raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+    msg = raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True, apply=True),
                  "a layer that does not say whether it has attachments fails the run, not exit 0"
                  "  <-- pinned defect", text="Failed layers: Pts")
     check("does not say whether it has attachments" in fake.errors[-1],
           "the failure says the tool could not tell")
-    results = download_service(env.base, folder, "Stub.gdb")
+    check("Done. 2 layer(s) complete, 1 failed." in fake.messages,
+          "a layer whose rows landed but whose attachment pass failed counts as failed only"
+          "  <-- pinned defect")
+    results = download_service(env.base, folder, "Stub.gdb", apply=True)
     check(len(results) == 3, "the same layer is pulled without --attachments")
     stub.layers[1].f.pop("no_has_att")
 
     stub.layers[0].f["att_count_fail"] = True
     folder = tempfile.mkdtemp(dir=env.root)
-    raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True),
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", attachments=True, apply=True),
            "a run against a server that cannot count attachments fails by default",
            text="Failed layers: Pts")
     check("--allow-uncounted-attachments" in fake.errors[-1],
           "the failure names the flag that accepts the weaker rule")
     folder = tempfile.mkdtemp(dir=env.root)
-    download_service(env.base, folder, "Stub.gdb", attachments=True, allow_uncounted=True)
+    download_service(env.base, folder, "Stub.gdb", attachments=True, allow_uncounted=True, apply=True)
     check("cap rule alone" in fake.warnings[-1],
           "with the opt-in a server that cannot count attachments is reported as weaker evidence")
     stub.layers[0].f.pop("att_count_fail")
@@ -2445,7 +2536,7 @@ def _service_checks(t, env):
     stub.token = tok
     stub.layers[0].f["att_404"] = True
     folder = tempfile.mkdtemp(dir=env.root)
-    raises(lambda: download_service(env.base, folder, "Stub.gdb", token=tok, attachments=True),
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", token=tok, attachments=True, apply=True),
            "an attachment failure fails the layer and the run", text="Failed layers: Pts")
     check("0" not in _load_progress(os.path.join(folder, "Stub.gdb.progress.json")),
           "a layer whose attachments failed is not recorded as finished")
@@ -2456,14 +2547,14 @@ def _service_checks(t, env):
     check(tok not in blob and quote(tok, safe="") not in blob,
           "the token reaches no message, warning, error, progress file or output file"
           "  <-- pinned defect")
-    raises(lambda: download_service(env.base, folder, "Stub.gdb", token="wrong"),
+    raises(lambda: download_service(env.base, folder, "Stub.gdb", token="wrong", apply=True),
            "a wrong token is refused by the server", text="stub refuses")
     stub.token = None
     stub.extra = []
 
     held = sorted(os.listdir(folder))
     for tail in ("?token=SECRETTOKEN123", "#SECRETTOKEN123"):
-        msg = raises(lambda: download_service(env.base + tail, folder, token="SECRETTOKEN123"),
+        msg = raises(lambda: download_service(env.base + tail, folder, token="SECRETTOKEN123", apply=True),
                      "a service URL with a query string or fragment is refused  <-- pinned defect",
                      text="query string or fragment")
         check("SECRETTOKEN123" not in msg and sorted(os.listdir(folder)) == held,
@@ -2472,14 +2563,14 @@ def _service_checks(t, env):
     secret = env.base.replace("http://", "http://admin:SECRETPW@")
     for url in (secret, env.base.replace("http://", "http://admin@"),
                 env.base.replace("http://", "http://:SECRETPW@")):
-        msg = raises(lambda: download_service(url, folder),
+        msg = raises(lambda: download_service(url, folder, apply=True),
                      "a service URL with a user name or password is refused  <-- pinned defect",
                      text="user name or password")
         check("SECRETPW" not in msg and sorted(os.listdir(folder)) == held,
               "the refusal neither echoes the password nor writes a geodatabase or progress file")
-    raises(lambda: download_service(env.base, os.path.join(folder, "nope")),
+    raises(lambda: download_service(env.base, os.path.join(folder, "nope"), apply=True),
            "a missing output folder is refused", text="does not exist")
-    raises(lambda: download_service(env.root_url + "/misc/nolayers", folder),
+    raises(lambda: download_service(env.root_url + "/misc/nolayers", folder, apply=True),
            "a service with no queryable layers is refused", text="No queryable layers")
 
 
@@ -2488,23 +2579,23 @@ def _cli_checks(t, env):
     check, raises, stub = t.check, t.raises, env.stub
     stub.layers = {0: _Layer(n=12)}
     folder = tempfile.mkdtemp(dir=env.root)
-    check(main([env.base, folder, "cli.gdb", "", "2237", "1=1"]) == 0 and os.path.isdir(
+    check(main([env.base, folder, "cli.gdb", "", "2237", "1=1", "--apply"]) == 0 and os.path.isdir(
         os.path.join(folder, "cli.gdb")), "main pulls a service from positional arguments")
     check(len([h for h in stub.hits if h[2].get("outSR") == "2237"]) > 0,
           "a positional out_sr reaches the query")
     with _swapped("SERVICE_URL", env.base), _swapped("OUTPUT_FOLDER", folder), \
-            _swapped("GDB_NAME", "cfg.gdb"):
+            _swapped("GDB_NAME", "cfg.gdb"), _swapped("APPLY", True):
         check(main([]) == 0 and os.path.isdir(os.path.join(folder, "cfg.gdb")),
               "main falls back to the CONFIG block when given nothing")
-    check(main([env.base, folder, "att.gdb", "--attachments", "--resume"]) == 0,
+    check(main([env.base, folder, "att.gdb", "--apply", "--attachments", "--resume"]) == 0,
           "main accepts --attachments and --resume together")
     stub.layers = {0: _att_layer(n=20, att_count_fail=True)}
-    raises(lambda: main([env.base, folder, "unc.gdb", "--attachments"]),
+    raises(lambda: main([env.base, folder, "unc.gdb", "--apply", "--attachments"]),
            "main refuses an uncounted attachment server by default", text="Failed layers")
-    check(main([env.base, folder, "unc.gdb", "--attachments", "--allow-uncounted-attachments",
+    check(main([env.base, folder, "unc.gdb", "--apply", "--attachments", "--allow-uncounted-attachments",
                 "--delay", "0"]) == 0, "main accepts --allow-uncounted-attachments and --delay")
     with _swapped("ALLOW_UNCOUNTED_ATTACHMENTS", True):
-        check(main([env.base, folder, "unc2.gdb", "--attachments"]) == 0,
+        check(main([env.base, folder, "unc2.gdb", "--apply", "--attachments"]) == 0,
               "the CONFIG switch accepts an uncounted attachment server too")
     check(_exit_code(lambda: _parser().parse_args(["--delay", "nan"])) == 2
           and _exit_code(lambda: _parser().parse_args(["--delay", "inf"])) == 2,
@@ -2513,18 +2604,25 @@ def _cli_checks(t, env):
     tok = "env+tok/1="
     stub.token = tok
     os.environ["FULLPULL_TOKEN"] = tok
-    check(main([env.base, folder, "tok1.gdb"]) == 0,
+    check(main([env.base, folder, "tok1.gdb", "--apply"]) == 0,
           "a token in FULLPULL_TOKEN reaches the server with no token argument")
     del os.environ["FULLPULL_TOKEN"]
-    raises(lambda: main([env.base, folder, "tok2.gdb"]), "with no token anywhere the server refuses",
+    raises(lambda: main([env.base, folder, "tok2.gdb", "--apply"]), "with no token anywhere the server refuses",
            text="stub refuses")
     with _swapped("sys", types.SimpleNamespace(stdin=io.StringIO(tok + "\n"), exit=sys.exit)):
-        check(main([env.base, folder, "tok3.gdb", "-"]) == 0,
+        check(main([env.base, folder, "tok3.gdb", "-", "--apply"]) == 0,
               "a token argument of - is read from standard input")
     with _swapped("sys", types.SimpleNamespace(stdin=io.StringIO("\n"), exit=sys.exit)):
-        raises(lambda: main([env.base, folder, "tok4.gdb", "-"]),
+        raises(lambda: main([env.base, folder, "tok4.gdb", "-", "--apply"]),
                "an empty standard input is no token", text="stub refuses")
     stub.token = None
+    dry = tempfile.mkdtemp(dir=env.root)
+    check(main([env.base, dry, "dry.gdb"]) == 0 and os.listdir(dry) == [],
+          "main without --apply exits 0 and writes nothing  <-- pinned defect")
+    check(_exit_code(lambda: _parser().parse_args(["u", "f", "--ap"])) == 2
+          and _exit_code(lambda: _parser().parse_args(["u", "f", "--appl"])) == 2
+          and _parser().parse_args(["u", "f", "--apply"]).apply,
+          "a prefix of --apply is refused, only the whole flag writes  <-- pinned defect")
     check(_exit_code(lambda: _parser().parse_args(["u", "f", "--attach"])) == 2,
           "a prefix of --attachments is refused, not expanded  <-- pinned defect")
     with _swapped("SERVICE_URL", ""):
@@ -2636,6 +2734,8 @@ def _parser():
                     help="Run the offline self-check against a local stub and exit")
     ap.add_argument("--self-check-live", action="store_true",
                     help="Run the layer checks against SELF_CHECK_URL and exit")
+    ap.add_argument("--apply", action="store_true",
+                    help="Write the geodatabase. Without it the run only reads and reports")
     ap.add_argument("--resume", action="store_true",
                     help="Skip layers an earlier interrupted run already finished")
     ap.add_argument("--attachments", action="store_true",
@@ -2707,6 +2807,7 @@ def main(argv=None):
         attachments=args.attachments,
         delay=args.delay,
         allow_uncounted=args.allow_uncounted_attachments or ALLOW_UNCOUNTED_ATTACHMENTS,
+        apply=args.apply or APPLY,
     )
     return 0
 
