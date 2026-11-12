@@ -45,6 +45,7 @@ import http.server
 import importlib.util
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -55,7 +56,7 @@ import tempfile
 import threading
 import time
 import types
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, urlparse
 
 # Why a real pull cannot run here: None means arcpy imported, otherwise the licence error text.
 ARCPY_LICENCE_ERROR = None
@@ -695,11 +696,45 @@ def attachment_batch_problems(batch, groups, counts, cap):
 
 
 def scrub(text, token):
-    """`text` with the token removed, in both the form it was sent and the URL-encoded form."""
+    """`text` with the token removed, as sent and in both URL-encoded forms.
+
+    requests writes a space in a query string as a plus sign, quote() as %20, so both are
+    removed.
+    """
     text = str(text)
-    for form in {token, quote(token or "", safe="")} - {"", None}:
+    forms = {token, quote(token or "", safe=""), quote_plus(token or "", safe="")}
+    for form in forms - {"", None}:
         text = text.replace(form, "<token>")
     return text
+
+
+class _TokenMask(logging.Filter):
+    """Removes every registered token from the log records urllib3 writes about a URL.
+
+    The attachment download is a GET, so its token sits in the query string, and urllib3
+    logs the whole path at WARNING level when it retries a dropped connection.
+    """
+
+    tokens = set()
+
+    def filter(self, record):
+        text = record.getMessage()
+        masked = text
+        for token in self.tokens:
+            masked = scrub(masked, token)
+        if masked != text:
+            record.msg, record.args = masked, None
+        return True
+
+
+_LOG_MASK = _TokenMask()
+
+
+def mask_token_in_logs(token):
+    """Keep `token` out of the urllib3 log records that quote a request URL."""
+    _TokenMask.tokens.add(token)
+    for name in ("urllib3.connectionpool", "urllib3.util.retry"):
+        logging.getLogger(name).addFilter(_LOG_MASK)
 
 
 # ---------------------------------------------------------------------- ingestion
@@ -848,12 +883,25 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
             count = int(arcpy.management.GetCount(staging)[0])
             problem = short_read_verdict(expected, count, repeated)
             # Offsets count rows from the top, so an edit made mid-pull can shift a row
-            # across a page boundary with the count unchanged. The other strategies name
-            # their rows or windows by id, which an edit cannot shift. Without an OID field
-            # there is nothing to compare, which the README names.
-            if not problem and shifts and oid:
-                problem = unread_verdict(current_ids(session, layer_url, where, token),
-                                         seen_ids)
+            # across a page boundary with the count unchanged. The other strategies read
+            # their id list or id window once, so a row added after that read is never
+            # asked for while the count still matches the earlier figure. Every strategy
+            # therefore compares the server's ids now with the ids it read. Only the offset
+            # strategy refuses when the list cannot be had: the others exist for servers
+            # that cannot list ids, so they pass with a warning. Without an OID field there
+            # is nothing to compare, which the README names.
+            unchecked = False
+            if not problem and oid:
+                try:
+                    now = current_ids(session, layer_url, where, token)
+                except (RuntimeError, requests.RequestException):
+                    if shifts:
+                        raise
+                    now = None
+                if now is None and not shifts:
+                    unchecked = True
+                else:
+                    problem = unread_verdict(now, seen_ids)
             if problem:
                 raise RuntimeError(problem)
         except Exception as exc:
@@ -864,6 +912,10 @@ def download_layer(session, service_url, layer, gdb, service_max, taken,
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         got = count
+        if unchecked:
+            arcpy.AddWarning(
+                "%s: the server gave no object id list after the %s pull, so a row added "
+                "during the pull cannot be ruled out" % (layer["name"], label))
         if index:
             # Never let a fallback pass silently. A layer that needs the quadtree is a
             # layer whose server is misreporting something, and that is worth knowing.
@@ -948,6 +1000,8 @@ def download_attachment(session, layer_url, parent, info, folder, token=None):
     path = os.path.join(folder, "%s_%s" % (info["id"], safe_filename(info.get("name"))))
     part = path + ".part"
     got = 0
+    if token:
+        mask_token_in_logs(token)
     _pace(session)
     try:
         resp = session.get(url, params={"token": token} if token else None, stream=True,
@@ -1445,13 +1499,18 @@ class _Stub(object):
                 return {}
             if f.get("ids_fail") == "all" or (f.get("ids_fail") and not p.get("geometry")):
                 return _ERR
+            if f.get("ids_fail_once") and not f.get("ids_failed"):
+                f["ids_failed"] = True
+                return _ERR
             ids = [str(r["oid"]) if f.get("ids_str") else r["oid"] for r in rows]
+            self.add_row_after(layer, "ids")
             return {"objectIdFieldName": "OBJECTID",
                     "objectIds": ids[:-1] if f.get("ids_short") else ids}
         if p.get("outStatistics"):
             if f.get("stats_fail"):
                 return _ERR
             ids = [r["oid"] for r in rows]
+            self.add_row_after(layer, "stats")
             return {"features": [{"attributes": {
                 "oid_min": min(ids) if ids else None, "oid_max": max(ids) if ids else None}}]}
         if p.get("returnExtentOnly") == "true":
@@ -1481,6 +1540,14 @@ class _Stub(object):
         if len(rows) > start + len(chosen) and f.get("flag", True):
             page["exceededTransferLimit"] = True
         return page
+
+    @staticmethod
+    def add_row_after(layer, moment):
+        """Another editor adds one row right after the answer named by `moment` was built."""
+        if layer.f.get("add_after") == moment and not layer.f.get("added"):
+            layer.f["added"] = True
+            layer.rows.append({"oid": max(r["oid"] for r in layer.rows) + 1,
+                               "x": 1.0, "y": 1.0, "geom": True})
 
     def query_attachments(self, layer, p):
         f = layer.f
@@ -1524,6 +1591,9 @@ class _Stub(object):
         data = next((d for i, n, d in layer.att.get(parent, []) if i == att_id), None)
         if data is None or f.get("att_404"):
             return 404, {}, b"missing", None
+        if f.get("att_drop") and not f.get("dropped"):
+            f["dropped"] = True
+            return 0, {}, b"", None
         if f.get("att_gzip"):
             return 200, {"Content-Encoding": "gzip"}, gzip.compress(data), None
         if f.get("att_short"):
@@ -1539,6 +1609,9 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         flat = {k: v[0] for k, v in params.items()}
         status, headers, body, claimed = self.server.stub.respond(
             self.command, urlparse(self.path).path, flat)
+        if status == 0:
+            self.close_connection = True  # hang up without answering
+            return
         self.send_response(status)
         for key, value in headers.items():
             self.send_header(key, value)
@@ -1780,6 +1853,9 @@ def _pure_checks(t):
           "a token is removed from a message in its URL-encoded form  <-- pinned defect")
     check(scrub("sent ab+c", "ab+c") == "sent <token>" and scrub("plain", None) == "plain",
           "the raw token is removed too, and no token leaves the message alone")
+    check(scrub("GET /x?token=a+b&f=json", "a b") == "GET /x?token=<token>&f=json"
+          and scrub("GET /x?token=a%20b", "a b") == "GET /x?token=<token>",
+          "a token with a space is removed in the plus form requests sends  <-- pinned defect")
 
     check(gdb_name_for("https://h/arcgis/rest/services/Public/Utilities/MapServer/")
           == "Public_Utilities.gdb", "the default gdb name comes from the service path")
@@ -1946,9 +2022,25 @@ def _strategy_checks(t, env):
     raises(lambda: env.pull(_Layer(n=2500, race="delete")),
            "one row deleted mid-pull is refused on every strategy", text="downloaded 2499 of 2500")
     (name, count), gdb = env.pull(_Layer(n=100, ids_absent=True))
-    check(count == 100 and "did not list its object ids" in fake.warnings[0],
+    check(count == 100 and "did not list its object ids" in " ".join(fake.warnings),
           "a server that will not list its ids cannot show an offset pull whole, so the range "
           "windows take over  <-- pinned defect")
+    check("no object id list after the objectId range pull" in fake.warnings[0],
+          "a range pull that cannot compare its ids with the server's says so, and passes")
+    msg = raises(lambda: env.pull(_Layer(n=30, paging=False, add_after="ids")),
+                 "a row added after the id list was read is refused on every strategy  "
+                 "<-- pinned defect", text="every strategy failed")
+    check("objectId list: 1 row(s) the server holds now were never read (first id 31)" in msg,
+          "the id-list strategy names the row it never asked for")
+    msg = raises(lambda: env.pull(_Layer(n=30, cap=10, paging=False, ids_fail_once=True,
+                                       add_after="stats")),
+                 "a row added after the OID range was read is refused on every strategy  "
+                 "<-- pinned defect", text="every strategy failed")
+    check("objectId range: 1 row(s) the server holds now were never read (first id 31)" in msg,
+          "the range strategy names the row its windows never reached")
+    (name, count), gdb = env.pull(_Layer(n=30, ids_fail_once=True))
+    check(count == 30 and "resultOffset paging: ArcGIS error" in fake.warnings[0],
+          "an id list that fails after an offset pull is a failure of that strategy, not a pass")
     check(unread_verdict([1, 2, "3"], {1, 2, 3}) is None,
           "an id list the pages all covered, in either number form, is whole")
     check("never read (first id 7)" in unread_verdict([9, 7], {1}),
@@ -2226,6 +2318,33 @@ def _attachment_checks(t, env):
     raises(lambda: download_attachment(env.session, env.url(0), 1, {"id": 1, "name": "a"},
                                        folder, token="wrong"),
            "a download with the wrong token is refused", text="403")
+    sent = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            sent.append(record.getMessage())
+
+    grab, urllib_log = _Grab(level=logging.WARNING), logging.getLogger("urllib3")
+    was = urllib_log.level
+    urllib_log.addHandler(grab)
+    urllib_log.setLevel(logging.WARNING)
+    try:
+        drop = _att_layer(n=14, every=7, per=1, att_drop=True)
+        stub.layers = {0: drop}
+        serial, fname, data = drop.att[7][0]
+        download_attachment(make_session(retries=1), env.base + "/0", 7,
+                            {"id": serial, "name": fname, "size": len(data)},
+                            tempfile.mkdtemp(dir=env.root), token=tok)
+        logging.getLogger("urllib3.connectionpool").warning("unrelated %s", "line")
+    finally:
+        urllib_log.removeHandler(grab)
+        urllib_log.setLevel(was)
+    retried = [m for m in sent if "Retrying" in m]
+    check(len(retried) == 1 and "<token>" in retried[0] and not any(
+              form in m for m in sent for form in (tok, quote(tok, safe=""), quote_plus(tok))),
+          "urllib3's log line for a retried attachment download never carries the token  "
+          "<-- pinned defect")
+    check("unrelated line" in sent, "a log record without the token is passed on unchanged")
     stub.token = None
 
 

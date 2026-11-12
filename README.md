@@ -91,7 +91,8 @@ verdict, `--resume`, and the attachment checks above.
   output SR is downloaded again.
 - Retries with backoff on 429 and 5xx, request timeouts, token support. The token travels in the
   POST body of every query, and in the URL only for the GET of an attachment. It is scrubbed from
-  the attachment error messages and from the non-JSON and ArcGIS error messages.
+  the attachment error messages and from the non-JSON and ArcGIS error messages, and masked in the
+  log lines urllib3 writes when it retries a dropped attachment download.
 - An optional delay between requests (`--delay` or `DELAY`), for public servers behind a web
   application firewall that bans clients for their request rate. On by default at 0.5 seconds;
   `--delay 0` turns it off for your own server.
@@ -323,6 +324,8 @@ PASS  the notjson message never echoes the token, in either form  <-- pinned def
 ...
 PASS  one row deleted and one added mid-pull keeps the count but shifts a row across a page; it is refused and refetched by id, never accepted short  <-- pinned defect
 ...
+PASS  a row added after the id list was read is refused on every strategy  <-- pinned defect
+...
 PASS  a server that returns no count is refused, not trusted  <-- pinned defect
 ...
 PASS  a server that counts 0 while the old copy holds rows is refused, not kept stale on exit 0  <-- pinned defect
@@ -343,29 +346,31 @@ PASS  a feature list one id short of the row count is refused  <-- pinned defect
 ...
 PASS  an attachment named ../../evil.txt stays inside its feature's folder  <-- pinned defect
 ...
-PASS  the token reaches no message, warning, error, progress file or output file  <-- pinned defect
+PASS  urllib3's log line for a retried attachment download never carries the token  <-- pinned defect
+...
+PASS  a resume with another filter downloads the layer again, not 'already complete'  <-- pinned defect
 ...
 PASS  a resume that wants attachments does not skip a layer finished without them  <-- pinned defect
 ...
+PASS  a layer that does not say whether it has attachments fails the run, not exit 0  <-- pinned defect
+...
+PASS  the token reaches no message, warning, error, progress file or output file  <-- pinned defect
+...
 PASS  a service URL with a query string or fragment is refused  <-- pinned defect
+...
+PASS  a service URL with a user name or password is refused  <-- pinned defect
 ...
 PASS  a delay that is not a finite number is refused, not read as no pacing  <-- pinned defect
 ...
 PASS  a prefix of --attachments is refused, not expanded  <-- pinned defect
 ...
-PASS  a resume with another filter downloads the layer again, not 'already complete'  <-- pinned defect
-...
-PASS  a layer that does not say whether it has attachments fails the run, not exit 0  <-- pinned defect
-...
-PASS  a service URL with a user name or password is refused  <-- pinned defect
-...
 PASS  an arcpy that imports but fails its licence is not reported as missing  <-- pinned defect
 ...
 --------------------------------------------------------------------
-223 assertions, 0 failed
+232 assertions, 0 failed
 ```
 
-The full run prints all 223 assertions. Each `...` line is where this block is cut.
+The full run prints all 232 assertions. Each `...` line is where this block is cut.
 
 It starts an HTTP server on `127.0.0.1` that behaves like ArcGIS Server and can be told to fail in
 the ways above: re-serve page one, drop rows it counted, return no count, truncate an attachment
@@ -381,13 +386,13 @@ Exit code 0 means every assertion held. Any failure prints `FAIL` and exits 1.
 
 | Host | Python | Assertions |
 |---|---|---:|
-| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 223 |
-| Windows, ArcGIS conda env | 3.13.7 | 223 |
-| Windows, venv | 3.9.25 | 223 |
-| Windows, venv | 3.12.10 | 223 |
-| Linux | 3.12.3 | 223 |
+| Windows | 3.13.2 (`C:\Python313`, needs `requests`, see below) | 232 |
+| Windows, ArcGIS conda env | 3.13.7 | 232 |
+| Windows, venv | 3.9.25 | 232 |
+| Windows, venv | 3.12.10 | 232 |
+| Linux | 3.12.3 | 232 |
 
-`C:\Python313` has no `requests` of its own. The 223 assertions ran there because `requests` comes
+`C:\Python313` has no `requests` of its own. The 232 assertions ran there because `requests` comes
 from the user site packages, and `PYTHONNOUSERSITE=1` or `-I` fails with `ModuleNotFoundError`. Run
 `python -m pip install requests` first on a bare interpreter.
 
@@ -403,7 +408,7 @@ python -m coverage run --branch fullpull.py --self-check
 python -m coverage report -m --include=fullpull.py
 ```
 
-reports 1,414 statements with none missed and 400 branches with none partial, 100 percent, on the
+reports 1,487 statements with none missed and 422 branches with none partial, 100 percent, on the
 geo venv (Python 3.13.2). `--include=fullpull.py` matters on the ArcGIS environment, where the
 report would otherwise list arcpy's own files. The two lines that look unreachable offline, the
 `except` branches around `import arcpy` and the false side of `if __name__ == "__main__"`, are
@@ -428,7 +433,9 @@ check off, attachment downloads not paced, the query-string refusal off, the tok
 non-JSON message, and a delay of NaN accepted. A fourth round turned it red for four more, one
 assertion group each: the user name and password refusal off, the missing `hasAttachments` check off,
 the resume comparison of service, filter and output SR off, and the skipped-layer warning turned
-back into a plain message.
+back into a plain message. A fifth round turned it red for three more: the token mask
+on urllib3's log records off, the end-of-pull id check limited again to the offset strategy, and the
+warning-only pass for the strategies that cannot list ids removed.
 
 ## Claims and where each was exercised
 
@@ -444,6 +451,8 @@ back into a plain message.
 | Retry on 429 and 503, timeout | stub that fails once, stub that sleeps. One retry each; the backoff delay is urllib3's and was not timed |
 | The old release accepted a repeated page and a missing count | commit 18fe1b7 run once against the stub, outside the self-check |
 | Token in POST, scrubbed from GET failures, absent from every output | stub that demands a token, scan of messages and files |
+| The token is masked in urllib3's retry log line | stub that hangs up on the first attachment GET, `urllib3` logging at WARNING, scan of the records |
+| A row added after an id list or OID range was read is not accepted | stub that adds a row right after the id list, and after the OID statistics, were answered |
 | Resume, with and without attachments | `download_service` against the stub |
 | Attachment batches, splitting, cap rule, file checks | stub with each fault in turn |
 | `--attachments`, `--resume`, prefix refusal, CONFIG fallback | `main()` against the stub |
@@ -470,10 +479,13 @@ back into a plain message.
   against the record cap the layer advertises. A server that cuts an answer short of that cap would
   pass. Lower `ATTACH_BATCH` to shrink the answers. There is no complete fix without counts.
 - **The row count is read once, before the pull.** Rows deleted or added during the pull make the
-  count disagree, or, for a pull by `resultOffset`, leave an id the server now holds unread; either
-  way that strategy is refused and the next one tries. The id check covers the offset strategy only,
-  and needs an OID field. The other three name rows or windows by id, which an edit cannot shift.
-  A layer edited constantly can fail every strategy and need a retry.
+  count disagree, or leave an id the server now holds unread; either way that strategy is refused
+  and the next one tries. After every strategy the tool lists the server's ids again and compares
+  them with the ids it read, which catches a row added after an id list or an OID range was read, and
+  a row shifted across a page by `resultOffset`. The check needs an OID field. When the server will
+  not list ids, the offset strategy is refused, and the other three pass with a warning, because they
+  exist for servers that cannot list ids. A layer edited constantly can fail every strategy and need
+  a retry.
 - **Repeats need an objectId.** A feature with no value for the OID field is not tracked, so for
   such a layer the count is the only check. A layer whose OID values are not unique is refused.
 - **The unit of `size` in the attachment list is not stated on its own page.** The Query
@@ -500,11 +512,29 @@ back into a plain message.
 - **Exit code 1 covers a refused layer, a crash, a missing arcpy and a licence failure.** Only the
   message says which, so a scheduled job cannot tell "tool failed" from "findings exist" by the code
   alone. Argument errors exit 2.
+- **The mutation counts above come from by-hand edits that are not shipped,** so they cannot be
+  regenerated from this repository.
+- **An ArcGIS error body on the count form is read as "cannot count", whatever its code.** The server
+  answers HTTP 200 with `{"error": {"code": 500}}`, which the tool cannot tell from "not supported".
+  Under the default the layer is refused. Under `--allow-uncounted-attachments` a transient server
+  error therefore downgrades the rest of that layer to the cap rule, and only the warning at the end
+  of the run says so.
+- **The cap rule assumes `queryAttachments` stops at the layer's record cap.** Esri's Query
+  Attachments page documents `maxRecordCount` only for `resultRecordCount` and says nothing of a
+  truncated attachment list. The rule matters only under `--allow-uncounted-attachments`.
+- **A layer with no OID field gets no end-of-pull id check and no repeat check.** The count is the
+  only check, and the tool does not warn about it. Published feature layers nearly always have one.
+- **A token typed into a wrong or extra argument slot is echoed in the usage error.** argparse prints
+  an unrecognised argument back, so a stray seventh positional argument shows on the terminal.
+- **A token typed at the `-` prompt shows on screen.** The tool reads it with `readline()`, not
+  `getpass`. Pipe the token in instead.
 - **The token goes wherever a redirect sends it.** If the server answers a POST with a 307 or 308,
   `requests` re-sends the body, token included, to the new host. Give fullpull the final https URL.
 - **The attachment download puts the token in the URL.** It can appear in the server's own access
-  logs, and in the log line of urllib3 at DEBUG level, so do not enable that logging on a run that
-  uses a token. Esri's header form was not checked.
+  logs. The tool masks the token in the records of the `urllib3.connectionpool` and
+  `urllib3.util.retry` loggers, which is where the retry line (WARNING) and the request line (DEBUG)
+  name the URL. A handler that reads the URL from somewhere else, such as a proxy or a packet
+  capture, is not covered. Esri's header form was not checked.
 - **A service URL with `http://` sends the token in clear text.** The tool neither refuses nor
   warns. Use https.
 - **A non-JSON answer is quoted in the error.** The first 200 characters of the body go into the
@@ -562,8 +592,11 @@ back into a plain message.
   the geoprocessing history.** The argument and CONFIG forms exist for script-tool compatibility.
   Giving `-` with an empty standard input yields no token and ignores `FULLPULL_TOKEN`, and the run
   then fails at the server with no hint that standard input was empty.
-- **`--self-check-live` sends three read-only requests to Esri's public sample server by default.**
-  Point `SELF_CHECK_URL` at your own server to avoid sending test traffic to someone else's.
+- **`--self-check-live` pulls the whole sample layer, several times, from Esri's public server by
+  default.** Its layer checks page the layer at three page sizes, run a naive stride and then call
+  `download_layer`. Against a stub shaped like SF311 layer 0 (9,705 rows, cap 1,000) that was 37
+  requests, and at the default delay of 0.5 seconds the pacing alone takes about 18 seconds. Point
+  `SELF_CHECK_URL` at your own server to avoid sending that traffic to someone else's.
 - **The numbers under "Notes from the original build"** are from one earlier run on a server that is
   not named here. The 254 s against 1.4 s figure in the file's docstring has the same status. They
   were not measured again.
